@@ -30,6 +30,8 @@ class Plant(Base):
         back_populates="plant", cascade="all, delete-orphan")
     instruments: Mapped[list["Instrument"]] = relationship(
         back_populates="plant", cascade="all, delete-orphan")
+    plc_tags: Mapped[list["PlcTag"]] = relationship(
+        back_populates="plant", cascade="all, delete-orphan")
 
 
 class Equipment(Base):
@@ -92,6 +94,26 @@ class Instrument(Base):
 
     plant: Mapped["Plant"] = relationship(back_populates="instruments")
     target: Mapped["Equipment"] = relationship()
+
+
+class PlcTag(Base):
+    """Links one simulation signal to one PLC variable. Edit plc_symbol to match your own PLC program."""
+    __tablename__ = "plc_tag"
+    __table_args__ = (
+        UniqueConstraint("plant_id", "entity_tag", "signal"),
+        UniqueConstraint("plant_id", "plc_symbol"),
+        CheckConstraint("direction IN ('to_plc', 'from_plc')", name="tag_direction"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plant_id: Mapped[int] = mapped_column(ForeignKey("plant.id"))
+    entity_tag: Mapped[str] = mapped_column(String(50))   # equipment or instrument tag, e.g. "P101"
+    signal: Mapped[str] = mapped_column(String(50))       # e.g. "RunCmd"
+    direction: Mapped[str] = mapped_column(String(10))    # "to_plc" (measurement) or "from_plc" (command)
+    data_type: Mapped[str] = mapped_column(String(10))    # BOOL, INT or REAL
+    plc_symbol: Mapped[str] = mapped_column(String(100))  # e.g. "GVL_Sim.P101_RunCmd"
+
+    plant: Mapped["Plant"] = relationship(back_populates="plc_tags")
 
 
 def add_equipment(plant, tag_name, type, params=None, inlets=(), outlets=()):

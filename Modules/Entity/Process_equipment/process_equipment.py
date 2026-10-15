@@ -16,6 +16,10 @@ class process_equipment(Entity):
         self.inlets = list(inlets) if inlets is not None else []
         self.outlets = list(outlets) if outlets is not None else []
 
+    def advance(self, dt):
+        """Move actuators (valve travel, pump ramp) toward their commands. Called at the start of each step."""
+        pass
+
     def max_outflow(self, dt):
         """Largest volume flow (L/s) this node can supply during one step."""
         return 0.0

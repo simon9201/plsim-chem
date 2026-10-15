@@ -10,7 +10,11 @@ from sqlalchemy.orm import Session
 
 from Data.database import get_engine
 from Data.Model.model import Base, Plant, add_equipment, add_instrument, connect
+from Data.loader import load_plant
+from Data.tags import export_gvl, load_tags, sync_tags
 from Modules.Flow.flow import Material
+
+PLC_DIR = os.path.join(PROJECT_ROOT, "PLC")
 
 # =====================================================================
 # Test plant: three feed tanks -> pumps and valves -> one reactor -> sink
@@ -41,9 +45,12 @@ def build_test_plant(session):
     session.add(plant)
 
     reactor = add_equipment(plant, "R201", "cstr",
-                            {"max_capacity": 1000.0, "initial_moles": liquid("water", 200.0)},
+                            {"max_capacity": 1000.0, "initial_moles": liquid("water", 200.0),
+                             "cooling_valve": "XV210"},
                             inlets=["in1", "in2", "in3"], outlets=["out1"])
-    out_valve = add_equipment(plant, "XV201", "valve", {"max_flow": 3.0},
+    # Cooling water valve: modulating, fails open so the reactor is cooled if the PLC goes away
+    add_equipment(plant, "XV210", "utility_valve", {"modulating": True, "fail_safe": 1.0})
+    out_valve = add_equipment(plant, "XV201", "valve", {"max_flow": 3.0, "modulating": True},
                               inlets=["in1"], outlets=["out1"])
     out_pipe = add_equipment(plant, "PI301", "pipe", inlets=["in1"], outlets=["out1"])
     sink = add_equipment(plant, "SNK301", "sink", inlets=["in1"])
@@ -61,7 +68,9 @@ def build_test_plant(session):
         tank = add_equipment(plant, f"TK{n}", "storage_tank",
                              {"max_capacity": 5000.0, "initial_moles": liquid(component, 3000.0)},
                              inlets=["in1"], outlets=["out1"])
-        pump = add_equipment(plant, f"P{n}", "pump", {"max_flow": 2.0}, inlets=["in1"], outlets=["out1"])
+        pump = add_equipment(plant, f"P{n}", "pump",
+                             {"max_flow": 2.0, "variable_speed": n == "103"},
+                             inlets=["in1"], outlets=["out1"])
         xv_out = add_equipment(plant, f"XV{int(n) + 10}", "valve", {"max_flow": 2.0},
                                inlets=["in1"], outlets=["out1"])
         connect(plant, src, "out1", xv_in, "in1")
@@ -84,6 +93,14 @@ def main():
         plant = build_test_plant(session)
         print(f"Stored plant '{plant.name}': {len(plant.equipment)} equipment, "
               f"{len(plant.connections)} connections, {len(plant.instruments)} instruments")
+
+        # Create the PLC tag table for this plant and write the matching TwinCAT variable list
+        sync_tags(session, PLANT_NAME, load_plant(session, PLANT_NAME))
+        tags = load_tags(session, PLANT_NAME)
+        os.makedirs(PLC_DIR, exist_ok=True)
+        with open(os.path.join(PLC_DIR, "GVL_Sim.st"), "w", encoding="utf-8") as f:
+            f.write(export_gvl(tags))
+        print(f"{len(tags)} PLC tags stored. Variable list written to PLC\\GVL_Sim.st")
 
 
 if __name__ == "__main__":

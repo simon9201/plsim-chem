@@ -5,7 +5,7 @@ from Modules.Plant.plant_model import PlantModel
 from Modules.Entity.Process_equipment.Vessel.StorageTank.storage_tank import StorageTank
 from Modules.Entity.Process_equipment.Vessel.Reactor.CSTR.CSTR import ContinuousStirredTankReactor
 from Modules.Entity.Process_equipment.Pump.Pump import Pump
-from Modules.Entity.Process_equipment.Valve.Valve import Valve
+from Modules.Entity.Process_equipment.Valve.Valve import Valve, UtilityValve
 from Modules.Entity.Process_equipment.Pipe.Pipe import Pipe
 from Modules.Entity.Process_equipment.Boundary.boundary import Source, Sink
 from Modules.Entity.Instrument.Flow_sensor.Flow_sensor import FlowSensor
@@ -19,10 +19,14 @@ EQUIPMENT_TYPES = {
     "cstr": ContinuousStirredTankReactor,
     "pump": Pump,
     "valve": Valve,
+    "utility_valve": UtilityValve,
     "pipe": Pipe,
     "source": Source,
     "sink": Sink,
 }
+
+# Parameters that name another piece of equipment. They are linked after everything is built.
+LINK_PARAMS = ("cooling_valve",)
 
 INSTRUMENT_TYPES = {
     "flow_sensor": FlowSensor,
@@ -43,12 +47,24 @@ def load_plant(session, plant_name):
     """Build a runnable PlantModel from the rows of a stored plant."""
     plant = session.scalars(select(Plant).where(Plant.name == plant_name)).one()
     model = PlantModel(plant.name)
+    links = []   # (equipment, attribute, tag of the equipment it refers to)
 
     for row in plant.equipment:
         cls = _lookup(EQUIPMENT_TYPES, row.type, row.tag_name)
-        inlets = [p.name for p in row.ports if p.direction == IN]
-        outlets = [p.name for p in row.ports if p.direction == OUT]
-        model.add_equipment(cls(row.tag_name, inlets=inlets, outlets=outlets, **row.params))
+        params = dict(row.params)
+        eq_links = {k: params.pop(k) for k in LINK_PARAMS if k in params}
+        if issubclass(cls, UtilityValve):
+            ports = {}
+        else:
+            ports = {"inlets": [p.name for p in row.ports if p.direction == IN],
+                     "outlets": [p.name for p in row.ports if p.direction == OUT]}
+        eq = model.add_equipment(cls(row.tag_name, **ports, **params))
+        links += [(eq, attr, tag) for attr, tag in eq_links.items()]
+
+    for eq, attr, tag in links:
+        if tag not in model.equipment:
+            raise ValueError(f"{eq.name}: {attr} refers to unknown equipment '{tag}'")
+        setattr(eq, attr, model.equipment[tag])
 
     for c in plant.connections:
         model.connect(c.from_port.equipment.tag_name, c.from_port.name,

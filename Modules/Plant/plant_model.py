@@ -41,8 +41,8 @@ class PlantModel:
         return eq
 
     def add_instrument(self, instrument):
-        if instrument.name in self.instruments:
-            raise ValueError(f"Duplicate instrument tag {instrument.name}")
+        if instrument.name in self.instruments or instrument.name in self.equipment:
+            raise ValueError(f"Duplicate tag {instrument.name}")
         self.instruments[instrument.name] = instrument
         return instrument
 
@@ -89,6 +89,7 @@ class PlantModel:
         lines = self._lines
         nodes = [eq for eq in self.equipment.values() if not isinstance(eq, Transfer)]
         for eq in self.equipment.values():
+            eq.advance(dt)
             if isinstance(eq, Transfer):
                 eq.flow = 0.0
 
@@ -113,6 +114,9 @@ class PlantModel:
         # 3. Streams are taken from the state at the start of the step, before anything is updated
         inflows, outflow = defaultdict(list), defaultdict(float)
         for line, q in zip(lines, flows):
+            starved = line.src.max_outflow(dt) <= 1e-9
+            for t in line.transfers:
+                t.observe(dt, starved)
             if q <= 0:
                 continue
             material = line.src.outlet_material(line.src_port, q)
@@ -126,7 +130,22 @@ class PlantModel:
         for node in nodes:
             node.update(dt, inflows[node.name], outflow[node.name])
         self.time += dt
+        for inst in self.instruments.values():
+            inst.sample()
 
     def read_instruments(self):
-        """Measured values, by instrument tag."""
-        return {tag: inst.read() for tag, inst in self.instruments.items()}
+        """Latest measured values, by instrument tag."""
+        return {tag: inst.value for tag, inst in self.instruments.items()}
+
+    def signal_table(self):
+        """All PLC signals of the plant: {(entity tag, signal name): Signal}."""
+        table = {}
+        for tag, entity in {**self.equipment, **self.instruments}.items():
+            for signal in entity.signals():
+                table[(tag, signal.name)] = signal
+        return table
+
+    def apply_failsafe(self):
+        """Put every actuator in its safe state (PLC connection lost)."""
+        for eq in self.equipment.values():
+            eq.apply_failsafe()

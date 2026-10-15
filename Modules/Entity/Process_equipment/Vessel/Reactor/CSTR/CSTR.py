@@ -26,7 +26,15 @@ class ContinuousStirredTankReactor(Reactor):
         self.heat_of_reaction = heat_of_reaction
         self.cooling_ua = cooling_ua
         self.coolant_temp = coolant_temp
-        self.cooling_command = 0.0          # 0..1, set by the PLC (later: a cooling valve entity)
+        self.cooling_command = 0.0          # 0..1, used only when no cooling valve is linked
+        self.cooling_valve = None           # a UtilityValve, linked by the loader
+
+    @property
+    def cooling_fraction(self):
+        """How open the cooling is, 0..1."""
+        if self.cooling_valve is not None:
+            return self.cooling_valve.position
+        return self.cooling_command
 
     def update(self, dt, inflows, outflow_rate):
         # 1. Flows and mixing via the vessel
@@ -50,6 +58,6 @@ class ContinuousStirredTankReactor(Reactor):
         heat_released = -self.heat_of_reaction * extent
         delta = self.temperature - self.coolant_temp
         limit = abs(delta) * heat_cap
-        cooling = self.cooling_ua * min(1.0, max(0.0, self.cooling_command)) * delta * dt
+        cooling = self.cooling_ua * min(1.0, max(0.0, self.cooling_fraction)) * delta * dt
         cooling = max(-limit, min(limit, cooling))
         self.temperature += (heat_released - cooling) / heat_cap
