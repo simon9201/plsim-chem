@@ -1,30 +1,55 @@
-# Modules/Vessel/Reactor/cstr/cstr.py
 import numpy as np
 from Modules.Entity.Process_equipment.Vessel.Reactor.Reactor import Reactor
+from Modules.Flow.flow import R_GAS
+
+# =====================================================================
+# Parent class: Reactor
+# Class: ContinuousStirredTankReactor (CSTR)
+# Reaction: A + B -> C, exothermic, rate = k(T) * [A] * [B]
+# =====================================================================
+
+T_REF_K = 298.15  # k_ref is given at 25 C
+
 
 class ContinuousStirredTankReactor(Reactor):
-    """En kontinuerlig omrörningsreaktor (CSTR) med exoterm dynamik."""
-    def __init__(self, name, max_capacity, initial_volume, initial_temp=25.0):
-        super().__init__(name, max_capacity, initial_volume, initial_temp)
-        
-    def update(self, dt, flow_in, flow_out, feed_conc_A, feed_temp, cooling_valve):
-        # 1. Uppdatera totalmassa/volym via Vessel-motorn
-        self.update_mass_balance(dt, flow_in, flow_out)
-        
-        # 2. Räkna ut CSTR-specifik reaktionshastighet (Arrhenius kinetik)
-        # Ju varmare det är, desto snabbare reagerar ämne A och blir ämne B (Exoterm risk!)
-        if self.volume > 0:
-            k = 0.1 * np.exp(0.05 * (self.temperature - 20.0)) # Kinetisk konstant
-            reaction_rate = k * self.concentration_A
-            
-            # Massbalans för komponent A: In - Ut - Reagerat
-            dC_A_dt = (flow_in / self.volume) * (feed_conc_A - self.concentration_A) - reaction_rate
-            self.concentration_A += dC_A_dt * dt
-            
-            # Energibalans (Temperaturförändring): Inströmning + Reaktionsvärme - Kylning
-            # Kylningen beror linjärt på hur mycket PLC:n öppnar kylventilen (0.0 till 1.0)
-            heat_generation = 50.0 * reaction_rate  # Exoterm värme
-            heat_removal = 15.0 * cooling_valve * (self.temperature - 15.0) # 15°C kylvatten
-            
-            dT_dt = (flow_in / self.volume) * (feed_temp - self.temperature) + heat_generation - heat_removal
-            self.temperature += dT_dt * dt
+    """Perfectly mixed reactor with Arrhenius kinetics, reaction heat and jacket cooling."""
+    def __init__(self, name, max_capacity, initial_moles=None, initial_temp=25.0,
+                 inlets=None, outlets=None,
+                 k_ref=0.002,               # L/(mol*s) at 25 C
+                 activation_energy=50e3,    # J/mol
+                 heat_of_reaction=-40e3,    # J/mol (negative = exothermic)
+                 cooling_ua=20e3,           # W/K at fully open cooling
+                 coolant_temp=15.0):        # C
+        super().__init__(name, max_capacity, initial_moles, initial_temp, inlets, outlets)
+        self.k_ref = k_ref
+        self.activation_energy = activation_energy
+        self.heat_of_reaction = heat_of_reaction
+        self.cooling_ua = cooling_ua
+        self.coolant_temp = coolant_temp
+        self.cooling_command = 0.0          # 0..1, set by the PLC (later: a cooling valve entity)
+
+    def update(self, dt, inflows, outflow_rate):
+        # 1. Flows and mixing via the vessel
+        super().update(dt, inflows, outflow_rate)
+
+        volume = self.volume
+        if volume <= 0:
+            return
+        contents = self.contents
+
+        # 2. Reaction: extent is limited by the available reactants
+        temp_k = self.temperature + 273.15
+        k = self.k_ref * np.exp(-self.activation_energy / R_GAS * (1.0 / temp_k - 1.0 / T_REF_K))
+        rate = k * contents.concentration("A") * contents.concentration("B")   # mol/(L*s)
+        extent = min(rate * volume * dt, contents.moles.get("A", 0.0), contents.moles.get("B", 0.0))
+        for name, coeff in (("A", -1.0), ("B", -1.0), ("C", 1.0)):
+            contents.moles[name] = contents.moles.get(name, 0.0) + coeff * extent
+
+        # 3. Energy balance: reaction heat in, jacket cooling out (cannot overshoot the coolant temperature)
+        heat_cap = contents.heat_capacity
+        heat_released = -self.heat_of_reaction * extent
+        delta = self.temperature - self.coolant_temp
+        limit = abs(delta) * heat_cap
+        cooling = self.cooling_ua * min(1.0, max(0.0, self.cooling_command)) * delta * dt
+        cooling = max(-limit, min(limit, cooling))
+        self.temperature += (heat_released - cooling) / heat_cap

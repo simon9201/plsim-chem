@@ -1,4 +1,8 @@
-
+# =====================================================================
+# Parent class: Entity
+# Class: Vessel (Handles general mass balance for vessels)
+# Subclasses: process_equipment, Instruments
+# =====================================================================
 class Entity:
     def __init__(self, name, description, status):
         self.name = name

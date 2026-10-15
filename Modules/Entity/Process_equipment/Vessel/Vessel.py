@@ -1,36 +1,54 @@
-import numpy as np
 from Modules.Entity.Process_equipment.process_equipment import process_equipment
+from Modules.Flow.flow import Material
 # =====================================================================
-# Parent class: Entity
-# Class: Vessel (Handles general mass balance for vessels)
+# Parent class: process_equipment
+# Class: Vessel (holds liquid: moles per component and a temperature)
 # Subclasses, Reactor, Storagetank
 # =====================================================================
 class Vessel(process_equipment):
-    """Base class for all processcontainers that are accumulating volume/mass"""
-    def __init__(self, name, max_capacity, initial_volume=0.0, initial_temp=25.0):
-        super().__init__(name, initial_temp, inlets = 1, outlets = 1)
+    """Base class for all process containers that accumulate liquid"""
+    def __init__(self, name, max_capacity, initial_moles=None, initial_temp=25.0,
+                 inlets=None, outlets=None):
+        # contents must exist before the base class sets self.temperature
+        self.contents = Material(initial_moles, initial_temp)
+        super().__init__(name, initial_temp=initial_temp, inlets=inlets, outlets=outlets)
         self.max_capacity = max_capacity    # Liter
-        self.volume = initial_volume        # Liter (Local state)
-        self.sensor_noise_std = 0.05        # Standard deviation from noise
-        
+        if self.contents.volume > max_capacity:
+            raise ValueError(f"{name}: initial contents ({self.contents.volume:.0f} L) exceed max_capacity")
+
+    @property
+    def temperature(self):
+        return self.contents.temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        self.contents.temperature = value
+
+    @property
+    def volume(self):
+        """Liter"""
+        return self.contents.volume
+
     @property
     def level_percent(self):
-        """Calculates the percentual fill level based on current volume"""
+        """Fill level based on current volume"""
         return (self.volume / self.max_capacity) * 100.0
 
-    def update_mass_balance(self, dt, flow_in, flow_out):
-        """Mass balance: dV = (F_in - F_out) * dt"""
-        net_flow = flow_in - flow_out
-        self.volume += net_flow * dt
-        
-        # Handles extremes conditions (Overflow and Empty)
-        if self.volume > self.max_capacity:
-            self.volume = self.max_capacity
-        elif self.volume < 0.0:
-            self.volume = 0.0
+    def concentration(self, component):
+        """mol/L"""
+        return self.contents.concentration(component)
 
-    def get_level_sensor(self):
-        """General interface for level sensors with noise interference"""
-        noise = np.random.normal(0, self.sensor_noise_std)
-        raw_reading = self.level_percent + noise
-        return max(0.0, min(100.0, raw_reading))
+    def max_outflow(self, dt):
+        return self.volume / dt
+
+    def max_inflow(self, dt):
+        return max(0.0, self.max_capacity - self.volume) / dt
+
+    def outlet_material(self, port, flow):
+        return self.contents.scaled_to_volume(flow)
+
+    def update(self, dt, inflows, outflow_rate):
+        """Mass balance: take out what leaves (at current composition), then mix in what arrives."""
+        self.contents.remove_volume(outflow_rate * dt)
+        for rate in inflows:
+            self.contents.add(rate.scaled(dt))

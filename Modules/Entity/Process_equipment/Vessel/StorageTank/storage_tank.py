@@ -6,13 +6,11 @@ from Modules.Entity.Process_equipment.Vessel.Vessel import Vessel
 # =====================================================================
 class StorageTank(Vessel):
     """ A specific vessel that inherits mass balances but has unique error cases"""
-    def __init__(self, name, max_capacity, initial_volume=0.0):
-        super().__init__(name, max_capacity, initial_volume, initial_temp = 25)
+    def __init__(self, name, max_capacity, initial_moles=None, initial_temp=25.0,
+                 inlets=None, outlets=None):
+        super().__init__(name, max_capacity, initial_moles, initial_temp, inlets, outlets)
         self.leak_rate = 0.0  # Liter/second (Used to simulate a pipebreak)
 
-    def update(self, dt, flow_in, flow_out):
-        # If a leak is present it will add to the out flow.
-        actual_outflow = flow_out + self.leak_rate
-        
-        # Using the parent class for its mass balance function
-        self.update_mass_balance(dt, flow_in, actual_outflow)
+    def update(self, dt, inflows, outflow_rate):
+        # A leak drains the tank in addition to the normal outflow.
+        super().update(dt, inflows, outflow_rate + self.leak_rate)
