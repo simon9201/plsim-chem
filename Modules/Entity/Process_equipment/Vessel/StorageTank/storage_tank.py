@@ -1,16 +1,26 @@
 from Modules.Entity.Process_equipment.Vessel.Vessel import Vessel
 
 # =====================================================================
-# Parent: Vessel
-# Class StorageTank (Simple container with a leakage simulation)
+# Parent class: Vessel
+# Class: StorageTank
+# `leak_rate` (L/s) is a fault hook: it drains liquid out of the plant.
 # =====================================================================
-class StorageTank(Vessel):
-    """ A specific vessel that inherits mass balances but has unique error cases"""
-    def __init__(self, name, max_capacity, initial_moles=None, initial_temp=25.0,
-                 inlets=None, outlets=None):
-        super().__init__(name, max_capacity, initial_moles, initial_temp, inlets, outlets)
-        self.leak_rate = 0.0  # Liter/second (Used to simulate a pipebreak)
 
-    def update(self, dt, inflows, outflow_rate):
-        # A leak drains the tank in addition to the normal outflow.
-        super().update(dt, inflows, outflow_rate + self.leak_rate)
+
+class StorageTank(Vessel):
+    def __init__(self, name, description="", status=1, inlets=None, outlets=None, leak_rate=0.0, **vessel_options):
+        super().__init__(name, description, status, inlets, outlets, **vessel_options)
+        self.leak_rate = leak_rate
+
+    def update(self, dt):
+        if self.leak_rate > 0:
+            self.contents.remove_volume(self.leak_rate * dt)
+
+    def get_state(self):
+        state = super().get_state()
+        state["leak_rate"] = float(self.leak_rate)
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        self.leak_rate = state["leak_rate"]

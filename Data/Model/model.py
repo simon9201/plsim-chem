@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from sqlalchemy import CheckConstraint, ForeignKey, JSON, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -32,6 +34,62 @@ class Plant(Base):
         back_populates="plant", cascade="all, delete-orphan")
     plc_tags: Mapped[list["PlcTag"]] = relationship(
         back_populates="plant", cascade="all, delete-orphan")
+    snapshots: Mapped[list["Snapshot"]] = relationship(
+        back_populates="plant", cascade="all, delete-orphan")
+
+
+class ChemComponent(Base):
+    """A chemical component. `attributes` holds any extra facts you want to track (hazard class, boiling point, ...)."""
+    __tablename__ = "component"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True)
+    molar_mass: Mapped[float]                       # g/mol
+    density: Mapped[float]                          # g/L
+    cp: Mapped[float]                               # J/(mol*K)
+    enthalpy_formation: Mapped[float | None]        # J/mol
+    attributes: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ChemReaction(Base):
+    """A reaction available to reactors. stoichiometry: {"A": -1, "B": -1, "C": 1}."""
+    __tablename__ = "reaction"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True)
+    stoichiometry: Mapped[dict] = mapped_column(JSON)
+    k_ref: Mapped[float]
+    activation_energy: Mapped[float]                # J/mol
+    orders: Mapped[dict | None] = mapped_column(JSON, default=None)
+    heat_of_reaction: Mapped[float | None]          # J/mol, empty = derived from formation enthalpies
+    description: Mapped[str] = mapped_column(String(500), default="")
+
+
+class Snapshot(Base):
+    """A saved state of a running plant (the state of every piece of equipment)."""
+    __tablename__ = "snapshot"
+    __table_args__ = (UniqueConstraint("plant_id", "name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plant_id: Mapped[int] = mapped_column(ForeignKey("plant.id"))
+    name: Mapped[str] = mapped_column(String(100))
+    sim_time: Mapped[float] = mapped_column(default=0.0)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+    plant: Mapped["Plant"] = relationship(back_populates="snapshots")
+    states: Mapped[list["SnapshotState"]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan")
+
+
+class SnapshotState(Base):
+    __tablename__ = "snapshot_state"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("snapshot.id"))
+    entity_tag: Mapped[str] = mapped_column(String(50))
+    state: Mapped[dict] = mapped_column(JSON)
+
+    snapshot: Mapped["Snapshot"] = relationship(back_populates="states")
 
 
 class Equipment(Base):

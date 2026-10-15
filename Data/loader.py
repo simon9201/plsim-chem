@@ -1,17 +1,21 @@
 from sqlalchemy import select
 
 from Data.Model.model import IN, OUT, Plant
+from Data.chemistry import load_chemistry
 from Modules.Plant.plant_model import PlantModel
 from Modules.Entity.Process_equipment.Vessel.StorageTank.storage_tank import StorageTank
 from Modules.Entity.Process_equipment.Vessel.Reactor.CSTR.CSTR import ContinuousStirredTankReactor
 from Modules.Entity.Process_equipment.Pump.Pump import Pump
-from Modules.Entity.Process_equipment.Valve.Valve import Valve, UtilityValve
-from Modules.Entity.Process_equipment.Pipe.Pipe import Pipe
+from Modules.Entity.Process_equipment.Valve.Valve import Valve, CheckValve, UtilityValve
+from Modules.Entity.Process_equipment.Pipe.Pipe import Pipe, Elbow
+from Modules.Entity.Process_equipment.Junction.junction import Manifold, Tee
 from Modules.Entity.Process_equipment.Boundary.boundary import Source, Sink
 from Modules.Entity.Instrument.Flow_sensor.Flow_sensor import FlowSensor
 from Modules.Entity.Instrument.Level_sensor.Level_sensor import LevelSensor
 from Modules.Entity.Instrument.Pressure_sensor.Pressure_sensor import PressureSensor
 from Modules.Entity.Instrument.Temperature_sensor.Temperature_sensor import TemperatureSensor
+from Modules.Entity.Instrument.Differential_pressure_sensor.Differential_pressure_sensor import DifferentialPressureSensor
+from Modules.Entity.Instrument.Analyzer_sensor.Analyzer_sensor import AnalyzerSensor
 
 # Maps the `type` column in the database to the Python class that implements it.
 EQUIPMENT_TYPES = {
@@ -19,8 +23,12 @@ EQUIPMENT_TYPES = {
     "cstr": ContinuousStirredTankReactor,
     "pump": Pump,
     "valve": Valve,
+    "check_valve": CheckValve,
     "utility_valve": UtilityValve,
     "pipe": Pipe,
+    "elbow": Elbow,
+    "manifold": Manifold,
+    "tee": Tee,
     "source": Source,
     "sink": Sink,
 }
@@ -33,6 +41,8 @@ INSTRUMENT_TYPES = {
     "level_sensor": LevelSensor,
     "pressure_sensor": PressureSensor,
     "temperature_sensor": TemperatureSensor,
+    "differential_pressure_sensor": DifferentialPressureSensor,
+    "analyzer": AnalyzerSensor,
 }
 
 
@@ -46,6 +56,7 @@ def _lookup(registry, type_name, tag):
 def load_plant(session, plant_name):
     """Build a runnable PlantModel from the rows of a stored plant."""
     plant = session.scalars(select(Plant).where(Plant.name == plant_name)).one()
+    load_chemistry(session)
     model = PlantModel(plant.name)
     links = []   # (equipment, attribute, tag of the equipment it refers to)
 

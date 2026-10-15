@@ -52,6 +52,13 @@ class Entity:
         for name, value in values.items():
             by_name[name].write(value)
 
+    def get_state(self):
+        """Everything that changes while the plant runs, as plain numbers/bools/dicts (saved in snapshots)."""
+        return {}
+
+    def set_state(self, state):
+        pass
+
     def apply_failsafe(self):
         """Put the commands in their safe state, used when the PLC connection is lost."""
         pass

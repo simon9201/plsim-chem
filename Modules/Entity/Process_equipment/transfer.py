@@ -1,26 +1,61 @@
-from Modules.Entity.Process_equipment.process_equipment import process_equipment
+from Modules.Entity.Process_equipment.process_equipment import ProcessEquipment
 
 # =====================================================================
-# Parent class: process_equipment
-# Class: Transfer (in-line element with one inlet and one outlet)
-# Subclasses: Pump, Valve, Pipe
+# Parent class: ProcessEquipment
+# Class: Transfer (one inlet, one outlet, no holdup)
+# Subclasses: Valve, CheckValve, Pump, Pipe, Elbow
 #
-# Flow model: each transfer element offers a maximum flow. The plant solver
-# lets the most restrictive element in a line set the flow, limited by what
-# the upstream vessel holds and the downstream vessel has room for.
-# This abstracts a pressure-driven network; a pressure model can replace
-# flow_limit() later.
+# A transfer element is a resistance in a line. Hydraulics are in bar and L/s:
+#     pressure drop = loss_coefficient * flow * |flow|        (bar)
+# A pump adds head_at_zero_flow (bar) on top. The plant solver chains the
+# elements between two vessels/junctions and solves the flow of the chain.
+# Subclasses only describe themselves through the methods below.
 # =====================================================================
-class Transfer(process_equipment):
-    def __init__(self, name, max_flow, inlets=None, outlets=None):
-        super().__init__(name, inlets=inlets or ["in1"], outlets=outlets or ["out1"])
-        self.max_flow = max_flow    # L/s at full capacity
-        self.flow = 0.0             # L/s, set by the plant solver every step
 
-    def flow_limit(self):
-        """Largest flow (L/s) this element allows right now."""
-        return self.max_flow
 
-    def observe(self, dt, starved):
-        """Called every step. starved is True when the upstream node has nothing to give."""
-        pass
+def k_to_resistance(k, diameter=0.05, open_fraction=1.0):
+    """Turn a velocity-head loss coefficient K into bar/(L/s)^2 for water in a pipe of this diameter."""
+    area = 3.141592653589793 * diameter ** 2 / 4.0 * max(open_fraction, 1e-6)
+    return k * 5e-9 / area ** 2
+
+
+class Transfer(ProcessEquipment):
+    one_way = False     # True: flow can only go from inlet to outlet
+
+    def __init__(self, name, description="", status=1, inlets=None, outlets=None):
+        inlets = inlets or ["in"]
+        outlets = outlets or ["out"]
+        if len(inlets) != 1 or len(outlets) != 1:
+            raise ValueError(f"{name}: a {type(self).__name__} has exactly one inlet and one outlet")
+        super().__init__(name, description, status, inlets, outlets)
+        self.p_in = 1.013
+        self.p_out = 1.013
+
+    @property
+    def pressure(self):
+        return self.p_in
+
+    @pressure.setter
+    def pressure(self, value):
+        self.p_in = value
+
+    @property
+    def differential_pressure(self):
+        return self.p_in - self.p_out
+
+    def is_blocked(self):
+        return False
+
+    def loss_coefficient(self):
+        """bar/(L/s)^2"""
+        return 0.0
+
+    def head_at_zero_flow(self):
+        """bar added by the element (pumps)"""
+        return 0.0
+
+    def advance(self, dt):
+        """Move internal dynamics (valve travel, pump ramp) before the flow is solved."""
+
+    def after_step(self, dt, starved):
+        """Called after the flow is solved. `starved` = nothing available at the inlet side."""

@@ -66,7 +66,7 @@ class PlcLoopTests(unittest.TestCase):
         cycle(plant, bridge, 1)
         value, raw = link.memory[sym("LT101", "Value")], link.memory[sym("LT101", "Raw")]
         self.assertAlmostEqual(raw / 32767 * 100, value, delta=0.01)
-        self.assertEqual(plant.equipment["TK101"].level_percent // 1, 60)
+        self.assertAlmostEqual(plant.equipment["TK101"].level_percent, 60.0, delta=0.5)
 
     def test_analog_commands(self):
         plant, tags, link, bridge = make_plant()
@@ -76,7 +76,7 @@ class PlcLoopTests(unittest.TestCase):
         mem[sym("XV113", "OpenCmd")] = True
         cycle(plant, bridge, 15)
         self.assertAlmostEqual(mem[sym("P103", "Speed")], 50.0, delta=0.1)
-        self.assertAlmostEqual(plant.equipment["P103"].flow, 1.0, delta=0.05)
+        self.assertAlmostEqual(plant.equipment["P103"].flow, 1.43, delta=0.1)
 
     def test_dry_run_trips_pump_until_reset(self):
         plant, tags, link, bridge = make_plant()

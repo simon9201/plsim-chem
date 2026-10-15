@@ -1,37 +1,79 @@
-from Modules.Entity.Process_equipment.process_equipment import process_equipment
+from Modules.Entity.Process_equipment.process_equipment import ProcessEquipment, P_ATM
 from Modules.Flow.flow import Material
 
 # =====================================================================
-# Parent class: process_equipment
-# Classes: Source (material entering the plant), Sink (material leaving it)
+# Parent class: ProcessEquipment
+# Classes: Source (arriving goods: liquid enters the plant), Sink (liquid leaves the plant)
+#
+# Both sit at the edge of the model and have fixed pressure. A Source can
+# only supply, a Sink can only accept. A source of an external chemical is
+# defined by its composition (mole fractions), temperature and supply pressure.
 # =====================================================================
-class Source(process_equipment):
-    """Unlimited supply with a fixed composition (mole fractions) and temperature."""
-    def __init__(self, name, composition, temperature=25.0, inlets=None, outlets=None):
-        super().__init__(name, initial_temp=temperature, inlets=inlets or [], outlets=outlets or ["out1"])
-        Material.from_fractions(composition, 1.0)   # validates component names
+
+
+class Source(ProcessEquipment):
+    def __init__(self, name, description="", status=1, inlets=None, outlets=None,
+                 composition=None, temperature=25.0, supply_pressure=2.0):
+        super().__init__(name, description, status, [], outlets or ["out"])
+        if not composition:
+            raise ValueError(f"{name}: a Source needs a composition, e.g. {{'A': 0.2, 'water': 0.8}}")
         self.composition = dict(composition)
-        self.supplied_volume = 0.0                  # L, total delivered
+        self.temperature = temperature
+        self.supply_pressure = supply_pressure
+        self.supplied = Material({}, temperature)   # everything that has entered the plant here
 
-    def max_outflow(self, dt):
-        return float("inf")
+    @property
+    def pressure(self):
+        return self.supply_pressure
 
-    def outlet_material(self, port, flow):
-        return Material.from_fractions(self.composition, flow, self.temperature)
+    @property
+    def supplied_volume(self):
+        return self.supplied.volume
 
-    def update(self, dt, inflows, outflow_rate):
-        self.supplied_volume += outflow_rate * dt
+    def port_pressure(self, port):
+        return self.supply_pressure
+
+    def can_supply(self, port):
+        return True
+
+    def stream(self, port):
+        return Material.from_fractions(self.composition, 1.0, self.temperature)
+
+    def draw(self, material):
+        self.supplied.add(material)
+
+    def get_state(self):
+        return {"supplied": self.supplied.to_state()}
+
+    def set_state(self, state):
+        self.supplied = Material.from_state(state["supplied"])
 
 
-class Sink(process_equipment):
-    """Takes everything delivered to it and keeps a running total."""
-    def __init__(self, name, inlets=None, outlets=None):
-        super().__init__(name, inlets=inlets or ["in1"], outlets=outlets or [])
-        self.received = Material()
+class Sink(ProcessEquipment):
+    def __init__(self, name, description="", status=1, inlets=None, outlets=None, sink_pressure=P_ATM):
+        super().__init__(name, description, status, inlets or ["in"], [])
+        self.sink_pressure = sink_pressure
+        self.received = Material({}, 25.0)   # everything that has left the plant here
 
-    def max_inflow(self, dt):
-        return float("inf")
+    @property
+    def pressure(self):
+        return self.sink_pressure
 
-    def update(self, dt, inflows, outflow_rate):
-        for rate in inflows:
-            self.received.add(rate.scaled(dt))
+    @property
+    def received_volume(self):
+        return self.received.volume
+
+    def port_pressure(self, port):
+        return self.sink_pressure
+
+    def can_accept(self, port):
+        return True
+
+    def receive(self, material):
+        self.received.add(material)
+
+    def get_state(self):
+        return {"received": self.received.to_state()}
+
+    def set_state(self, state):
+        self.received = Material.from_state(state["received"])

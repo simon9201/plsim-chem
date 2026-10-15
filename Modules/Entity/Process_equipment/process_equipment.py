@@ -1,37 +1,44 @@
 from Modules.Entity.Entity import Entity
+
 # =====================================================================
 # Parent class: Entity
-# Class: process_equipment (anything the process liquid flows through)
-# Subclasses: Vessel, Transfer (Pump, Valve, Pipe), Source, Sink
+# Class: ProcessEquipment (anything with ports that is part of the flow network)
+# Subclasses: Vessel (tanks, reactors), Transfer (pump, valve, pipe), Junction (manifold, tee), Boundary (source, sink)
 #
-# inlets/outlets are lists of port names (same names as in the database).
-# The PlantModel connects the ports and calls the "node" methods below.
-# Nodes are equipment where material accumulates or enters/leaves the plant.
+# Ports are named sockets. `inlets` and `outlets` are lists of port names and
+# must match the Port rows in the database. A connection always joins an
+# outlet of one piece of equipment to an inlet of another.
 # =====================================================================
-class process_equipment(Entity):
-    def __init__(self, name, initial_temp=25.0, inlets=None, outlets=None, description=""):
-        super().__init__(name, description=description, status=1)
-        self.temperature = initial_temp     # C
-        self.pressure = 1.013               # bar(a), static for now (hook for pressure sensors)
-        self.inlets = list(inlets) if inlets is not None else []
-        self.outlets = list(outlets) if outlets is not None else []
+G = 9.81            # m/s2
+P_ATM = 1.013       # bar
 
-    def advance(self, dt):
-        """Move actuators (valve travel, pump ramp) toward their commands. Called at the start of each step."""
-        pass
+
+class ProcessEquipment(Entity):
+    def __init__(self, name, description="", status=1, inlets=None, outlets=None):
+        super().__init__(name, description, status)
+        self.inlets = list(inlets or [])
+        self.outlets = list(outlets or [])
+        self.flow = 0.0     # L/s through the equipment during the last step
+
+    # ---- what the flow solver asks of anything that is a node (not a Transfer) ----
+    def port_pressure(self, port):
+        """Pressure (bar) seen by a pipe attached to this port."""
+        raise NotImplementedError(f"{self.name} cannot be a flow-network node")
+
+    def can_supply(self, port):
+        return False
+
+    def can_accept(self, port):
+        return False
 
     def max_outflow(self, dt):
-        """Largest volume flow (L/s) this node can supply during one step."""
-        return 0.0
+        """L/s the equipment could deliver for one step in total."""
+        return float("inf")
 
     def max_inflow(self, dt):
-        """Largest volume flow (L/s) this node can accept during one step."""
-        return 0.0
+        """L/s the equipment could take in for one step in total."""
+        return float("inf")
 
-    def outlet_material(self, port, flow):
-        """Material rate (mol/s) leaving through a port at a given volume flow (L/s)."""
-        raise NotImplementedError(f"{self.name} cannot supply material")
-
-    def update(self, dt, inflows, outflow_rate):
-        """Advance one step. inflows: list of Material rates (mol/s), outflow_rate: total L/s leaving."""
-        pass
+    @property
+    def is_empty(self):
+        return False

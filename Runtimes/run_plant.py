@@ -1,117 +1,95 @@
-# Runtimes/run_plant.py
 import argparse
 import os
 import sys
 import time
 
-# Setup for a dynamic search path.
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from sqlalchemy.orm import Session
 
+from Data.build_test_plant import PLANT_NAME
 from Data.database import get_engine
 from Data.loader import load_plant
+from Data.snapshots import list_snapshots, load_snapshot, save_snapshot
 from Data.tags import load_tags
 from Modules.PLC.bridge import AdsLink, LinkError, LoopbackLink, PlcBridge
 
-DEFAULT_PLANT = "test_plant_3tank_reactor"
-RECONNECT_INTERVAL = 2.0    # s between reconnect attempts
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Run a stored plant against a TwinCAT PLC.")
-    p.add_argument("--plant", default=DEFAULT_PLANT, help="name of the plant in the database")
-    p.add_argument("--dt", type=float, default=0.1, help="simulation step in seconds (default 0.1)")
-    p.add_argument("--speed", type=float, default=1.0, help="1 = real time, 2 = twice as fast")
-    p.add_argument("--duration", type=float, default=0.0, help="stop after this many simulated seconds (0 = run until Ctrl+C)")
-    p.add_argument("--print-every", type=float, default=5.0, help="status line interval in simulated seconds")
-    p.add_argument("--ams-net-id", default="127.0.0.1.1.1", help="AMS Net ID of the TwinCAT runtime")
-    p.add_argument("--port", type=int, default=851, help="ADS port of the PLC runtime (851 = first PLC)")
-    p.add_argument("--offline", action="store_true", help="no PLC: all commands stay at 0 (closed/stopped)")
-    return p.parse_args()
-
-
-def status_line(plant):
-    m = plant.read_instruments()
-    r = plant.equipment["R201"]
-    return (f"t={plant.time:7.1f}s  TK101={m['LT101']:5.1f}%  TK102={m['LT102']:5.1f}%  "
-            f"TK103={m['LT103']:5.1f}%  R201: level={m['LT201']:5.1f}%  T={m['TT201']:5.1f}C  "
-            f"[C]={r.concentration('C'):5.2f} mol/L  out={m['FT201']:4.2f} L/s")
+# =====================================================================
+# Runtime: loads a plant from the database and runs it in step with the PLC.
+#   read commands from the PLC -> advance the plant by dt -> write feedback
+# If the PLC connection is lost the plant goes to its fail-safe commands and
+# the runtime keeps trying to reconnect.
+# =====================================================================
 
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser(description="Run a plant model against a TwinCAT PLC")
+    ap.add_argument("--plant", default=PLANT_NAME)
+    ap.add_argument("--dt", type=float, default=0.1, help="simulation step in seconds")
+    ap.add_argument("--speed", type=float, default=1.0, help="2 = simulate twice as fast as real time")
+    ap.add_argument("--duration", type=float, default=None, help="stop after this many simulated seconds")
+    ap.add_argument("--ams-net-id", default="127.0.0.1.1.1")
+    ap.add_argument("--port", type=int, default=851)
+    ap.add_argument("--offline", action="store_true", help="no PLC: use an in-memory loopback")
+    ap.add_argument("--load-snapshot", help="restore this saved snapshot before starting")
+    ap.add_argument("--save-snapshot", help="save a snapshot with this name when the run ends")
+    ap.add_argument("--list-snapshots", action="store_true")
+    args = ap.parse_args()
+
     with Session(get_engine()) as session:
+        if args.list_snapshots:
+            for name, sim_time, created in list_snapshots(session, args.plant):
+                print(f"{name}: sim time {sim_time:.1f} s, saved {created:%Y-%m-%d %H:%M:%S}")
+            return
         plant = load_plant(session, args.plant)
         tags = load_tags(session, args.plant)
-    if not tags:
-        sys.exit("The plant has no PLC tags. Run Data/build_test_plant.py first.")
+        if args.load_snapshot:
+            load_snapshot(session, args.plant, plant, args.load_snapshot)
+            print(f"Restored snapshot '{args.load_snapshot}' (sim time {plant.time:.1f} s)")
 
-    link = LoopbackLink() if args.offline else AdsLink(args.ams_net_id, args.port)
-    bridge = PlcBridge(plant, tags, link)
-
-    connected = False
-    try:
-        link.connect()
-        connected = True
-        print(f"Connected to the PLC ({'offline' if args.offline else f'{args.ams_net_id}:{args.port}'})")
-    except LinkError as err:
-        print(f"{err}\nStarting anyway with fail-safe commands; will keep trying to connect.")
-        plant.apply_failsafe()
-
-    print(f"Runtime started: plant '{plant.name}', {len(plant.equipment)} equipment, "
-          f"{len(plant.instruments)} instruments, {len(tags)} PLC tags. Ctrl+C stops.")
-
-    tick = args.dt / args.speed
-    next_tick = time.perf_counter()
-    next_print = 0.0
-    next_reconnect = 0.0
-    try:
-        while args.duration <= 0 or plant.time < args.duration:
-            if connected:
+        link = LoopbackLink() if args.offline else AdsLink(args.ams_net_id, args.port)
+        bridge = PlcBridge(plant, tags, link)
+        connected = False
+        start_time = plant.time
+        next_tick = time.monotonic()
+        try:
+            while args.duration is None or plant.time - start_time < args.duration:
+                if not connected:
+                    try:
+                        link.connect()
+                        connected = True
+                        print("PLC connected")
+                    except LinkError as err:
+                        print(f"Waiting for PLC: {err}")
+                        plant.apply_failsafe()
+                        plant.step(args.dt)     # the plant keeps running on its fail-safe commands
+                        time.sleep(1.0)
+                        continue
                 try:
                     bridge.read_commands()
-                except LinkError as err:
-                    print(f"t={plant.time:.1f}s  PLC connection lost ({err}). Actuators go to fail-safe.")
-                    plant.apply_failsafe()
-                    connected = False
-                    next_reconnect = plant.time + RECONNECT_INTERVAL
-            elif plant.time >= next_reconnect:
-                try:
-                    link.connect()
-                    connected = True
-                    print(f"t={plant.time:.1f}s  PLC connection restored.")
-                except LinkError:
-                    next_reconnect = plant.time + RECONNECT_INTERVAL
-
-            plant.step(args.dt)
-
-            if connected:
-                try:
+                    plant.step(args.dt)
                     bridge.write_feedback()
                 except LinkError as err:
-                    print(f"t={plant.time:.1f}s  PLC connection lost ({err}). Actuators go to fail-safe.")
-                    plant.apply_failsafe()
+                    print(f"PLC link lost ({err}): fail-safe")
                     connected = False
-                    next_reconnect = plant.time + RECONNECT_INTERVAL
+                    plant.apply_failsafe()
+                    continue
 
-            if plant.time >= next_print:
-                print(status_line(plant))
-                next_print += args.print_every
-
-            next_tick += tick
-            delay = next_tick - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            elif delay < -1.0:
-                print(f"t={plant.time:.1f}s  Running behind real time by {-delay:.1f}s (lower --speed or raise --dt)")
-                next_tick = time.perf_counter()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        link.close()
+                next_tick += args.dt / args.speed
+                delay = next_tick - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_tick = time.monotonic()
+        except KeyboardInterrupt:
+            print("Stopped")
+        finally:
+            link.close()
+            if args.save_snapshot:
+                save_snapshot(session, args.plant, plant, args.save_snapshot, overwrite=True)
+                print(f"Saved snapshot '{args.save_snapshot}' at sim time {plant.time:.1f} s")
 
 
 if __name__ == "__main__":

@@ -1,34 +1,11 @@
-from dataclasses import dataclass
+from Modules.Flow.chemistry import COMPONENTS, R_GAS    # noqa: F401  (re-exported for convenience)
 
 # =====================================================================
-# Material model for liquids: what a stream or vessel content consists of.
-# Amounts are tracked as moles per component; volume, concentration and
-# heat capacity are derived from that. Ideal mixing is assumed.
+# Material: an amount of liquid, tracked as moles per component plus a
+# temperature. Volume, concentration, density and heat capacity are derived
+# from that, assuming ideal mixing. Vessels hold a Material; streams are a
+# Material used as a rate (mol/s).
 # =====================================================================
-
-R_GAS = 8.314  # J/(mol*K)
-
-
-@dataclass(frozen=True)
-class Component:
-    name: str
-    molar_mass: float   # g/mol
-    density: float      # g/L (pure liquid)
-    cp: float           # J/(mol*K) (liquid heat capacity)
-
-    @property
-    def molar_volume(self):
-        """Liter per mol"""
-        return self.molar_mass / self.density
-
-
-# Placeholder test chemistry: A + B -> C in water.
-COMPONENTS = {c.name: c for c in (
-    Component("water", 18.015, 997.0, 75.3),
-    Component("A", 60.0, 1000.0, 120.0),
-    Component("B", 46.0, 800.0, 110.0),
-    Component("C", 106.0, 900.0, 190.0),
-)}
 
 
 def _check_names(names):
@@ -38,8 +15,7 @@ def _check_names(names):
 
 
 class Material:
-    """An amount of liquid (moles per component, temperature in C).
-    The same class is used as a rate (mol/s) for streams; temperature is then the stream temperature."""
+    """moles: {component: mol} (or mol/s for a stream), temperature in C."""
 
     def __init__(self, moles=None, temperature=25.0):
         self.moles = dict(moles or {})
@@ -64,6 +40,17 @@ class Material:
         return sum(n * COMPONENTS[k].molar_volume for k, n in self.moles.items())
 
     @property
+    def mass(self):
+        """Gram"""
+        return sum(n * COMPONENTS[k].molar_mass for k, n in self.moles.items())
+
+    @property
+    def density(self):
+        """g/L, 0 when empty"""
+        volume = self.volume
+        return self.mass / volume if volume > 0 else 0.0
+
+    @property
     def heat_capacity(self):
         """J/K"""
         return sum(n * COMPONENTS[k].cp for k, n in self.moles.items())
@@ -72,6 +59,25 @@ class Material:
         """mol/L"""
         volume = self.volume
         return self.moles.get(name, 0.0) / volume if volume > 0 else 0.0
+
+    def mole_fractions(self):
+        total = sum(self.moles.values())
+        return {k: n / total for k, n in self.moles.items()} if total > 0 else {}
+
+    def mass_fractions(self):
+        total = self.mass
+        return {k: n * COMPONENTS[k].molar_mass / total for k, n in self.moles.items()} if total > 0 else {}
+
+    def attribute_average(self, attribute):
+        """Mole-fraction weighted average of a numeric component attribute, for example 'boiling_point_c'.
+        Components that do not have the attribute are ignored. None if no component has it."""
+        total, weight = 0.0, 0.0
+        for name, x in self.mole_fractions().items():
+            value = COMPONENTS[name].attributes.get(attribute)
+            if isinstance(value, (int, float)):
+                total += x * value
+                weight += x
+        return total / weight if weight > 0 else None
 
     def copy(self):
         return Material(self.moles, self.temperature)
@@ -101,3 +107,10 @@ class Material:
         removed = self.scaled(fraction)
         self.moles = {k: n * (1.0 - fraction) for k, n in self.moles.items()}
         return removed
+
+    def to_state(self):
+        return {"moles": {k: float(n) for k, n in self.moles.items()}, "temperature": float(self.temperature)}
+
+    @classmethod
+    def from_state(cls, state):
+        return cls(state["moles"], state["temperature"])
