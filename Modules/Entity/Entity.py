@@ -62,3 +62,12 @@ class Entity:
     def apply_failsafe(self):
         """Put the commands in their safe state, used when the PLC connection is lost."""
         pass
+
+    def slow_update(self, dt, ambient):
+        """Slow processes (weather exchange, fouling, wear), called every PlantModel.slow_interval
+        with dt in slow-clock seconds and the outdoor temperature (C)."""
+        pass
+
+    def repair(self):
+        """Maintenance: restore the condition of the equipment (see ProcessEquipment.repair)."""
+        pass

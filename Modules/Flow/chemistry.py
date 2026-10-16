@@ -24,6 +24,10 @@ class Component:
     cp: float                                   # J/(mol*K), liquid heat capacity
     enthalpy_formation: Optional[float] = None  # J/mol, liquid at 25 C (used to derive reaction enthalpies)
     # Free-form facts worth tracking: {"boiling_point_c": 118, "hazard": "corrosive", ...}
+    # Used by the simulation: boiling_point_c (cavitation), freezing_point_c (ice in cold pipes),
+    # solubility_25c [mol/L] and solubility_slope [mol/L per C]: deposits in pipes and precipitates as a solid in vessels
+    # when the liquid is over-saturated. Optional solid_density [g/L] sets the volume of the precipitate.
+    # Vapor-liquid data (antoine_a/b/c, heat_of_vaporization, cp_gas, noncondensable) is described in Modules/Flow/thermo.py.
     attributes: dict = field(default_factory=dict)
 
     @property
@@ -75,10 +79,14 @@ class Reaction:
 
 
 DEFAULT_COMPONENTS = (
-    Component("water", 18.015, 997.0, 75.3, -285830.0, {"role": "solvent", "boiling_point_c": 100.0}),
+    Component("water", 18.015, 997.0, 75.3, -285830.0, {"role": "solvent", "boiling_point_c": 100.0, "freezing_point_c": 0.0,
+                    "antoine_a": 4.6543, "antoine_b": 1435.264, "antoine_c": -64.848,
+                    "heat_of_vaporization": 40660.0, "cp_gas": 33.6}),
     Component("A", 60.0, 1000.0, 120.0, -100e3, {"role": "reactant"}),
     Component("B", 46.0, 800.0, 110.0, -50e3, {"role": "reactant"}),
     Component("C", 106.0, 900.0, 190.0, -290e3, {"role": "product"}),
+    # Permanent gas for headspaces and gas lines. Its liquid values are only used if it is ever forced into a liquid.
+    Component("N2", 28.014, 808.0, 57.0, 0.0, {"role": "inert", "noncondensable": True, "cp_gas": 29.1}),
 )
 
 DEFAULT_REACTIONS = (

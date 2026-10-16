@@ -5,6 +5,9 @@ from Modules.Entity.Process_equipment.process_equipment import ProcessEquipment
 from Modules.Entity.Process_equipment.transfer import Transfer
 from Modules.Entity.Process_equipment.Boundary.boundary import Source, Sink
 from Modules.Entity.Process_equipment.Vessel.Vessel import Vessel
+from Modules.Entity.Process_equipment.Pump.Pump import Pump
+from Modules.Plant.environment import Environment
+from Modules.Plant.gas_network import GasNetwork
 from Modules.Flow.flow import Material
 
 # =====================================================================
@@ -22,7 +25,8 @@ from Modules.Flow.flow import Material
 #      Junction pressures are unknown, so they are found by iteration until
 #      flow in = flow out at every junction.
 #   3. liquid (moles per component + temperature) is moved along the edges
-#   4. vessels update themselves (reactions, cooling, leaks)
+#   3b. gas moves through its own network (Modules/Plant/gas_network.py)
+#   4. vessels and gas volumes run their own physics (leaks, precipitation, freezing, reactions, flashing)
 #   5. instruments take their measurements
 # Units: bar, L/s, g, mol, J, degrees C.
 # =====================================================================
@@ -52,7 +56,7 @@ class Edge:
             self.a = DIRECT_RESISTANCE
         self.a = max(self.a, MIN_RESISTANCE)
         self.b = sum(e.head_at_zero_flow() for e in self.elements)
-        self.blocked = any(e.is_blocked() for e in self.elements)
+        self.blocked = any(not e.status or e.is_blocked() for e in self.elements)
         self.one_way = any(e.one_way for e in self.elements)
 
     def flow(self):
@@ -78,7 +82,7 @@ class Edge:
         def drop(el):
             return el.loss_coefficient() * quad - el.head_at_zero_flow()
 
-        first_blocked = next((i for i, e in enumerate(self.elements) if e.is_blocked()), None)
+        first_blocked = next((i for i, e in enumerate(self.elements) if not e.status or e.is_blocked()), None)
         stop = len(self.elements) if (q != 0 or first_blocked is None) else first_blocked
         p = p_src
         for el in self.elements[:stop]:
@@ -107,8 +111,19 @@ class PlantModel:
         self._links = []        # (from tag, from port, to tag, to port)
         self._edges = []
         self._dirty = True
+        # Slow processes (weather exchange, fouling, wear) run every slow_interval seconds of plant time.
+        # slow_time_scale speeds them up (and the weather cycles) relative to the hydraulics.
+        self.environment = Environment()
+        self.slow_interval = 10.0
+        self.slow_time_scale = 1.0
+        self.slow_time = 0.0
+        self._slow_acc = 0.0
+        self._gas = GasNetwork(self)    # the gas side: GasVolume/Compressor/... (Modules/Plant/gas_network.py)
 
-    # ------------------------------------------------------------ building
+    @property
+    def ambient_temperature(self):
+        return self.environment.temperature(self.slow_time)
+
     def add_equipment(self, eq):
         if eq.name in self.equipment or eq.name in self.instruments:
             raise ValueError(f"Duplicate tag {eq.name}")
@@ -124,10 +139,12 @@ class PlantModel:
 
     def connect(self, from_tag, from_port, to_tag, to_port):
         src, dst = self.equipment[from_tag], self.equipment[to_tag]
-        if from_port not in getattr(src, "outlets", []):
+        if from_port not in list(getattr(src, "outlets", [])) + list(getattr(src, "gas_outlets", [])):
             raise ValueError(f"{from_tag} has no outlet '{from_port}'")
-        if to_port not in getattr(dst, "inlets", []):
+        if to_port not in list(getattr(dst, "inlets", [])) + list(getattr(dst, "gas_inlets", [])):
             raise ValueError(f"{to_tag} has no inlet '{to_port}'")
+        if src.is_gas_port(from_port) != dst.is_gas_port(to_port):
+            raise ValueError(f"Cannot connect a gas port to a liquid port: {from_tag}.{from_port} -> {to_tag}.{to_port}")
         for f, fp, t, tp in self._links:
             if (f, fp) == (from_tag, from_port) or (t, tp) == (to_tag, to_port):
                 raise ValueError(f"Port already connected: {from_tag}.{from_port} -> {to_tag}.{to_port}")
@@ -138,7 +155,7 @@ class PlantModel:
         """Find the lines between nodes and check that the network makes sense."""
         out_map = {(f, fp): (t, tp) for f, fp, t, tp in self._links}
         in_map = {(t, tp) for _, _, t, tp in self._links}
-        transfers = [eq for eq in self.equipment.values() if isinstance(eq, Transfer)]
+        transfers = [eq for eq in self.equipment.values() if isinstance(eq, Transfer) and eq.domain == "liquid"]
         for tr in transfers:
             if (tr.name, tr.inlets[0]) not in in_map:
                 raise ValueError(f"{tr.name}: inlet is not connected")
@@ -147,14 +164,18 @@ class PlantModel:
 
         edges, used = [], set()
         for tag, node in self.equipment.items():
-            if not isinstance(node, ProcessEquipment) or isinstance(node, Transfer):
+            if not isinstance(node, ProcessEquipment) or isinstance(node, Transfer) or node.domain == "gas":
                 continue
             for port in node.outlets:
                 if (tag, port) not in out_map:
                     continue
                 elements, (cur, cur_port) = [], out_map[(tag, port)]
+                path = set()
                 while isinstance(self.equipment[cur], Transfer):
                     tr = self.equipment[cur]
+                    if tr.name in path:
+                        raise ValueError(f"Transfer-only cycle detected while tracing from {tag}.{port}: {tr.name}")
+                    path.add(tr.name)
                     elements.append(tr)
                     used.add(cur)
                     cur, cur_port = out_map[(cur, tr.outlets[0])]
@@ -167,6 +188,7 @@ class PlantModel:
         for e in edges:
             self._node_edges.setdefault(e.src.name, []).append((e, "src"))
             self._node_edges.setdefault(e.dst.name, []).append((e, "dst"))
+        self._gas.build()
         self._dirty = False
 
     # ------------------------------------------------------------ solving
@@ -180,11 +202,11 @@ class PlantModel:
 
     @staticmethod
     def _out_cap(node, port, n, dt):
-        return node.max_outflow(dt) / n if node.can_supply(port) else 0.0
+        return node.max_outflow(dt) / n if node.status and node.can_supply(port) else 0.0
 
     @staticmethod
     def _in_cap(node, port, n, dt):
-        return node.max_inflow(dt) / n if node.can_accept(port) else 0.0
+        return node.max_inflow(dt) / n if node.status and node.can_accept(port) else 0.0
 
     def _net_inflow(self, junction):
         total = 0.0
@@ -256,16 +278,24 @@ class PlantModel:
             else:
                 sup, sup_port, acc = e.dst, e.dst_port, e.src
             moved = self._supplied(sup, sup_port, cache, set()).scaled_to_volume(abs(e.q) * dt)
-            moves.append((sup, acc, moved))
-        for sup, _, moved in moves:
+            leaked = sum(el.leak_rate for el in e.elements)
+            received = moved.scaled(max(0.0, 1.0 - leaked / abs(e.q))) if leaked > 0 else moved
+            moves.append((sup, acc, moved, received))
+        for sup, _, moved, _ in moves:
             if not isinstance(sup, Junction):
                 sup.draw(moved)
-        for _, acc, moved in moves:
+        for _, acc, _, received in moves:
             if not isinstance(acc, Junction):
-                acc.receive(moved)
+                acc.receive(received)
 
     # ------------------------------------------------------------ time stepping
     def step(self, dt):
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("Simulation step dt must be a finite positive number")
+        if not math.isfinite(self.slow_interval) or self.slow_interval <= 0:
+            raise ValueError("slow_interval must be a finite positive number")
+        if not math.isfinite(self.slow_time_scale) or self.slow_time_scale < 0:
+            raise ValueError("slow_time_scale must be a finite non-negative number")
         if self._dirty:
             self._build_edges()
         for eq in self.equipment.values():
@@ -276,8 +306,9 @@ class PlantModel:
         for e in self._edges:
             e.record()
             starved = e.q == 0 and e.src.is_empty
+            fluid = self._supplied(e.src, e.src_port, {}, set()) if e.elements else None
             for el in e.elements:
-                el.after_step(dt, starved)
+                el.after_step(dt, starved, fluid)
         for node, attached in self._node_edges.items():
             eq = self.equipment[node]
             if isinstance(eq, (Source, Sink)):
@@ -285,9 +316,18 @@ class PlantModel:
             elif not isinstance(eq, Junction):
                 eq.flow = sum(e.q if r == "dst" else -e.q for e, r in attached)
         self._move_material(dt)
+        self._gas.step(dt)
         for eq in self.equipment.values():
-            if isinstance(eq, Vessel):
-                eq.update(dt)
+            if hasattr(eq, "run_step"):     # vessels (leak, solids, freezing, reactions, flash) and gas volumes
+                eq.run_step(dt)
+        self._slow_acc += dt
+        while self._slow_acc >= self.slow_interval:
+            self._slow_acc -= self.slow_interval
+            slow_dt = self.slow_interval * self.slow_time_scale
+            self.slow_time += slow_dt
+            ambient = self.ambient_temperature
+            for eq in self.equipment.values():
+                eq.slow_update(slow_dt, ambient)
         self.time += dt
         self.sample_instruments()
 
@@ -307,17 +347,69 @@ class PlantModel:
         for ent in self.entities():
             ent.apply_failsafe()
 
+    # ------------------------------------------------------------ faults
+    def set_fault(self, tag, name, value):
+        """Inject (or clear, with 0/False) a fault on a piece of equipment, e.g. set_fault("TK-101", "leak_rate", 0.5).
+        Each class lists the faults it supports in FAULTS."""
+        eq = self.equipment[tag]
+        faults = getattr(eq, "FAULTS", ())
+        if name not in faults:
+            raise ValueError(f"{tag} ({type(eq).__name__}) does not support fault '{name}'. Supported: {list(faults)}")
+        if name == "stuck":
+            if not isinstance(value, bool) and value not in (0, 1):
+                raise ValueError(f"{tag}.{name} must be a boolean")
+            value = bool(value)
+        else:
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as err:
+                raise ValueError(f"{tag}.{name} must be a finite number") from err
+            if not math.isfinite(value):
+                raise ValueError(f"{tag}.{name} must be a finite number")
+            if name in ("blockage", "fouling", "wear") and not 0.0 <= value <= 1.0:
+                raise ValueError(f"{tag}.{name} must be between 0 and 1")
+            if name == "leak_rate" and value < 0.0:
+                raise ValueError(f"{tag}.{name} cannot be negative")
+        setattr(eq, name, value)
+
+    # ------------------------------------------------------------ maintenance
+    def repair(self, tag):
+        """Maintenance on one piece of equipment: wear, fouling, ice, blockage, stuck actuators, leaks and
+        settled solids are reset to like-new. Commands, trips (cleared by the PLC's reset) and the
+        material inside are left alone. This is not "replace": the equipment keeps its identity and state."""
+        self.equipment[tag].repair()
+
+    def repair_all(self):
+        for eq in self.equipment.values():
+            eq.repair()
+
     # ------------------------------------------------------------ snapshots
     def get_state(self):
-        return {"time": float(self.time),
-                "equipment": {tag: eq.get_state() for tag, eq in self.equipment.items()}}
+        equipment = {}
+        for tag, eq in self.equipment.items():
+            state = eq.get_state()
+            if getattr(eq, "leak_rate", 0.0):
+                state = {**state, "leak_rate": float(eq.leak_rate)}
+            equipment[tag] = state
+        return {"time": float(self.time), "slow_time": float(self.slow_time),
+                "slow_acc": float(self._slow_acc), "slow_interval": float(self.slow_interval),
+                "slow_time_scale": float(self.slow_time_scale),
+                "environment": self.environment.get_state(), "equipment": equipment}
 
     def set_state(self, state):
         unknown = [t for t in state["equipment"] if t not in self.equipment]
         if unknown:
             raise ValueError(f"Snapshot has equipment that is not in this plant: {unknown}")
         for tag, eq_state in state["equipment"].items():
+            eq = self.equipment[tag]
+            if isinstance(eq, ProcessEquipment):
+                eq.leak_rate = float(eq_state.get("leak_rate", 0.0))
             if eq_state:
-                self.equipment[tag].set_state(eq_state)
+                eq.set_state(eq_state)
         self.time = state["time"]
+        self.slow_time = state.get("slow_time", 0.0)
+        self._slow_acc = state.get("slow_acc", 0.0)
+        self.slow_interval = state.get("slow_interval", self.slow_interval)
+        self.slow_time_scale = state.get("slow_time_scale", self.slow_time_scale)
+        self.environment.set_state(state.get("environment", {}))
         self.sample_instruments()

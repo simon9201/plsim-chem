@@ -65,7 +65,7 @@ def build_test_plant(session):
         add(f"XV10{n}", "valve", {"rated_dp": 0.5, "max_flow": 4.0}, ["in"], ["out"])
         add(f"TK10{n}", "storage_tank",
             {"max_capacity": 2000.0, "height": 3.0, "initial_volume": 1200.0,
-             "composition": composition, "temperature": 20.0},
+             "composition": composition, "temperature": 20.0, "ambient_ua": 50.0},
             ["in1"], ["out1"])
         add(f"P10{n}", "pump", {"shutoff_head": 0.5, "max_flow": 2.4}, ["in"], ["out"])
         add(f"XV11{n}", "valve", {"rated_dp": 0.5, "max_flow": 3.0}, ["in"], ["out"])

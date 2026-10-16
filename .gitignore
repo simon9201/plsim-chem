@@ -2,3 +2,7 @@ Modules/Entity/Process_equipment/__pycache__/process_equipment.cpython-311.pyc
 Modules/Entity/__pycache__/Entity.cpython-311.pyc
 Modules/Entity/Process_equipment/Vessel/StorageTank/__pycache__/storage_tank.cpython-311.pyc
 *.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+venv/

@@ -10,6 +10,9 @@ from Modules.Flow.chemistry import (DEFAULT_COMPONENTS, DEFAULT_REACTIONS, Compo
 # =====================================================================
 
 
+THERMO_KEYS = ("freezing_point_c", "antoine_a", "antoine_b", "antoine_c", "heat_of_vaporization", "cp_gas")
+
+
 def seed_chemistry(session):
     """Insert the built-in components/reactions that are not in the database yet. Existing rows are left alone."""
     have = set(session.scalars(select(ChemComponent.name)))
@@ -23,6 +26,15 @@ def seed_chemistry(session):
             session.add(ChemReaction(name=r.name, stoichiometry=dict(r.stoichiometry), k_ref=r.k_ref,
                                      activation_energy=r.activation_energy, orders=dict(r.orders),
                                      heat_of_reaction=r.heat_of_reaction, description=r.description))
+    # Databases created before the thermo data existed: add the missing thermo keys to the built-in rows
+    # (never overwrites a value you changed).
+    for c in DEFAULT_COMPONENTS:
+        row = session.scalars(select(ChemComponent).where(ChemComponent.name == c.name)).one_or_none()
+        if row is None:
+            continue
+        missing = {k: v for k, v in c.attributes.items() if k in THERMO_KEYS and k not in (row.attributes or {})}
+        if missing:
+            row.attributes = {**(row.attributes or {}), **missing}
     session.commit()
 
 

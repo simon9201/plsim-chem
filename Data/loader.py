@@ -5,6 +5,9 @@ from Data.chemistry import load_chemistry
 from Modules.Plant.plant_model import PlantModel
 from Modules.Entity.Process_equipment.Vessel.StorageTank.storage_tank import StorageTank
 from Modules.Entity.Process_equipment.Vessel.Reactor.CSTR.CSTR import ContinuousStirredTankReactor
+from Modules.Entity.Process_equipment.Vessel.FlashDrum.flash_drum import FlashDrum
+from Modules.Entity.Process_equipment.Gas.gas import (GasVolume, GasSource, GasSink, GasPipe, GasValve,
+                                                      GasCheckValve, Compressor)
 from Modules.Entity.Process_equipment.Pump.Pump import Pump
 from Modules.Entity.Process_equipment.Valve.Valve import Valve, CheckValve, UtilityValve
 from Modules.Entity.Process_equipment.Pipe.Pipe import Pipe, Elbow
@@ -31,6 +34,14 @@ EQUIPMENT_TYPES = {
     "tee": Tee,
     "source": Source,
     "sink": Sink,
+    "flash_drum": FlashDrum,            # ports named gas* / vapor* join the gas network
+    "gas_volume": GasVolume,
+    "gas_source": GasSource,
+    "gas_sink": GasSink,
+    "gas_pipe": GasPipe,
+    "gas_valve": GasValve,
+    "gas_check_valve": GasCheckValve,
+    "compressor": Compressor,
 }
 
 # Parameters that name another piece of equipment. They are linked after everything is built.
@@ -63,6 +74,7 @@ def load_plant(session, plant_name):
     for row in plant.equipment:
         cls = _lookup(EQUIPMENT_TYPES, row.type, row.tag_name)
         params = dict(row.params)
+        leak_rate = params.pop("leak_rate", 0.0)
         eq_links = {k: params.pop(k) for k in LINK_PARAMS if k in params}
         if issubclass(cls, UtilityValve):
             ports = {}
@@ -70,6 +82,8 @@ def load_plant(session, plant_name):
             ports = {"inlets": [p.name for p in row.ports if p.direction == IN],
                      "outlets": [p.name for p in row.ports if p.direction == OUT]}
         eq = model.add_equipment(cls(row.tag_name, **ports, **params))
+        if leak_rate:
+            model.set_fault(row.tag_name, "leak_rate", leak_rate)
         links += [(eq, attr, tag) for attr, tag in eq_links.items()]
 
     for eq, attr, tag in links:

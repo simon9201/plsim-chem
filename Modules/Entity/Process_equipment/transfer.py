@@ -21,6 +21,7 @@ def k_to_resistance(k, diameter=0.05, open_fraction=1.0):
 
 class Transfer(ProcessEquipment):
     one_way = False     # True: flow can only go from inlet to outlet
+    FAULTS = ("leak_rate",)
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None):
         inlets = inlets or ["in"]
@@ -57,5 +58,6 @@ class Transfer(ProcessEquipment):
     def advance(self, dt):
         """Move internal dynamics (valve travel, pump ramp) before the flow is solved."""
 
-    def after_step(self, dt, starved):
-        """Called after the flow is solved. `starved` = nothing available at the inlet side."""
+    def after_step(self, dt, starved, fluid=None):
+        """Called after the flow is solved. `starved` = nothing available at the inlet side.
+        `fluid` = the Material arriving at the inlet (None when nothing flows)."""

@@ -26,7 +26,9 @@ class ContinuousStirredTankReactor(Reactor):
 
     @property
     def cooling_fraction(self):
-        return self.cooling_valve.position if self.cooling_valve is not None else self.cooling_command
+        if self.cooling_valve is not None:
+            return self.cooling_valve.position if self.cooling_valve.status else 0.0
+        return self.cooling_command
 
     def update(self, dt):
         self.heat_released = 0.0
@@ -38,9 +40,11 @@ class ContinuousStirredTankReactor(Reactor):
         cp = self.contents.heat_capacity
         self.cooling_duty = 0.0
         if cp > 0:
-            duty = self.cooling_ua * self.cooling_fraction * (self.temperature - self.coolant_temp)
-            self.cooling_duty = duty
-            self.contents.temperature -= duty * dt / cp
+            old_temperature = self.temperature
+            ua = self.cooling_ua * self.cooling_fraction
+            self.contents.temperature = self.coolant_temp + (old_temperature - self.coolant_temp) * math.exp(
+                -ua * dt / cp)
+            self.cooling_duty = cp * (old_temperature - self.temperature) / dt
 
     def _react(self, reaction, dt):
         """Advance one reaction over dt. Returns the heat released (J, positive = exothermic)."""

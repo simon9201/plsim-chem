@@ -32,7 +32,7 @@ class ActuatedMixin:
             self.command = min(1.0, max(0.0, command))
 
     def _move(self, dt):
-        if self.stuck:
+        if self.stuck or not self.status:
             return
         step = dt / self.travel_time if self.travel_time > 0 else 1.0
         self.position += max(-step, min(step, self.command - self.position))
@@ -49,6 +49,13 @@ class ActuatedMixin:
             Signal("Position", TO_PLC, "REAL", "%", get=lambda: self.position * 100.0),
         ]
 
+    def repair(self):
+        """Free a stuck actuator (and, for valves with ports, stop a leak)."""
+        self.stuck = False
+        parent = super()
+        if hasattr(parent, "repair"):
+            parent.repair()
+
     def _actuator_state(self):
         return {"command": float(self.command), "position": float(self.position), "stuck": bool(self.stuck)}
 
@@ -63,6 +70,7 @@ class ActuatedMixin:
 
 class Valve(ActuatedMixin, Transfer):
     """Control/on-off valve. rated_dp (bar) is the pressure drop at max_flow (L/s) when fully open."""
+    FAULTS = ("leak_rate", "stuck")
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  rated_dp=0.5, max_flow=4.0, travel_time=3.0, fail_position=0.0, initial_position=0.0):
@@ -72,7 +80,7 @@ class Valve(ActuatedMixin, Transfer):
         self._init_actuator(travel_time, fail_position, initial_position)
 
     def is_blocked(self):
-        return self.position <= 0.005
+        return not self.status or self.position <= 0.005
 
     def loss_coefficient(self):
         pos = max(self.position, 0.005)
