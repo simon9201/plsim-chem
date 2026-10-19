@@ -425,7 +425,7 @@ class PlantModel:
                 raise ValueError(f"{tag}.{name} must be a finite number") from err
             if not math.isfinite(value):
                 raise ValueError(f"{tag}.{name} must be a finite number")
-            if name in ("blockage", "fouling", "wear", "fatigue") and not 0.0 <= value <= 1.0:
+            if name in ("blockage", "fouling", "wear", "fatigue", "stiction") and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{tag}.{name} must be between 0 and 1")
             if name == "leak_rate" and value < 0.0:
                 raise ValueError(f"{tag}.{name} cannot be negative")

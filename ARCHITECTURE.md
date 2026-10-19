@@ -138,14 +138,30 @@ audits signal leakage and scans inference sources for simulator internals. This 
 security sandbox; deployment needs process isolation, least-privilege credentials, PLC read-only permissions,
 and an independent security review.
 
-Synthetic training adds deterministic sensor noise and random-walk drift, varies suction-valve and hot-liquid
-cavitation, gradual grid-voltage drift, and healthy baseline episodes across two valve-placement layouts.
+Synthetic training (`Modules/Watchdog/scenarios.py`, fault time-shapes in `faults.py`, cached parallel generation in
+`corpus.py`) draws randomised plants (loop, transfer, heated, reactor, tubular), 18 failure modes (cavitation variants, grid drift,
+fouling, blockage, leak, wear, seized valve, heater runaway, reactor cooling loss / coolant fouling / warm coolant,
+cold-wall product scaling (`wall_scaling`, generator v5), compounds, plus fault-free benign-transient,
+sensor-nuisance and baseline days), random fault shapes (ramp, accelerating, step, saw-tooth, bursts), and
+imperfect instruments (noise, drift, lag, offset, spikes, freezes, valve stiction). All of that is simulation
+side; the model sees only `OperatorView` channels, and the evaluation-only `TRUTH.*` column is never a feature.
 Random scheduled grid dips are excluded from predictive
 labels because an unannounced event has no observable pre-event precursor. Validation selects a threshold under
 a configured false-alarm budget; independent test episodes report AUC, event recall, alert precision, false
 alarms per operating hour, and median lead time. The saved artifact includes model/schema version, source
 fingerprints, train/validation/test provenance, metrics and the operating threshold. A no-alert threshold is
 recorded explicitly if the validation set cannot meet the false-alarm budget with an alerting model.
+
+Two detectors come out of training. The supervised `RiskModel` predicts a trip within the horizon. The normal-only
+`SubspaceDetector` (`model.py`, saved beside the model as `*.anomaly.npz`) is fitted on fault-free episodes only
+(PCA residual plus Hotelling T-squared of the window features, each scaled to its healthy 99th percentile, so 1.0
+is the edge of normal). It has its own validation-selected threshold and, live, raises an advisory flag
+(`Report.anomaly_alarm`) for behaviour unlike anything healthy, including failures nobody has recorded. Plants
+differ in their sensors, so training uses the union of channels; a channel absent from a plant (reactor
+temperature on a plain loop) reads 0.0 and is listed in the model's `optional_channels`, which the live watchdog
+tolerates. `run_campaign` (`scenarios.py`) is a long "training plant": one plant that meets random incidents at
+random times under a day/night and seasonal ambient cycle, is repaired and restarted by a simulated operator, and
+feeds training (`--campaigns N`) and evaluation like any episode.
 
 ## One simulation step
 

@@ -7,7 +7,8 @@ from Modules.Entity.Process_equipment.transfer import Transfer, k_to_resistance
 #
 # The PLC commands a position (OpenCmd for on/off, PositionSP 0..100 % for
 # control valves). The real valve takes `travel_time` seconds to move and
-# reports OpenFb / ClosedFb. `stuck` is a fault hook: the valve stops moving.
+# reports OpenFb / ClosedFb. `stuck` is a fault hook: the valve stops moving. `stiction` is a deadband: corrections
+# smaller than it do nothing, which makes a controlled valve hunt around its setpoint.
 # =====================================================================
 
 
@@ -22,6 +23,7 @@ class ActuatedMixin:
         self.position = initial_position     # 0..1, actual
         self.command = initial_position      # 0..1, wanted
         self.stuck = False
+        self.stiction = 0.0                  # deadband (0..1 of travel): the valve ignores commands closer than this
         self._last_written = dict(UNTOUCHED)
 
     def _write_command(self, signal, value, command):
@@ -33,6 +35,9 @@ class ActuatedMixin:
 
     def _move(self, dt):
         if self.stuck or not self.status:
+            return
+        # Stiction: small corrections do not break the valve free; full open/close commands always do.
+        if 0.0 < abs(self.command - self.position) < self.stiction and self.command not in (0.0, 1.0):
             return
         step = dt / self.travel_time if self.travel_time > 0 else 1.0
         self.position += max(-step, min(step, self.command - self.position))
@@ -57,10 +62,12 @@ class ActuatedMixin:
             parent.repair()
 
     def _actuator_state(self):
-        return {"command": float(self.command), "position": float(self.position), "stuck": bool(self.stuck)}
+        return {"command": float(self.command), "position": float(self.position), "stuck": bool(self.stuck),
+                "stiction": float(self.stiction)}
 
     def _set_actuator_state(self, s):
         self.command, self.position, self.stuck = s["command"], s["position"], s["stuck"]
+        self.stiction = s.get("stiction", 0.0)
         self._last_written = dict(UNTOUCHED)
 
     def apply_failsafe(self):
@@ -70,7 +77,7 @@ class ActuatedMixin:
 
 class Valve(ActuatedMixin, Transfer):
     """Control/on-off valve. rated_dp (bar) is the pressure drop at max_flow (L/s) when fully open."""
-    FAULTS = ("leak_rate", "stuck")
+    FAULTS = ("leak_rate", "stuck", "stiction")
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  rated_dp=0.5, max_flow=4.0, travel_time=3.0, fail_position=0.0, initial_position=0.0):

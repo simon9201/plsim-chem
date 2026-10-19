@@ -29,6 +29,7 @@ instrument. See `ARCHITECTURE.md` for the code map and "Model scope" below for c
 | I want to ... | Do this |
 |---|---|
 | Take the guided tour | Launcher: **Build demo plant (guided tour)**, then follow [Demo plant tour](#demo-plant-tour) |
+| Explore the reactor and slow-degradation physics | Launcher: **Build reactor training plant (CSTR + PFR)**: a stirred and a tubular reactor line, each with a long cold product pipe. Scenarios: *Normal operation*, *Cooling loss*, *Wall scaling* (product plates out on the cold wall: flow sags, pressure falls after the line) and *Snow day* |
 | Start everything from one window | `python launcher.py`: one window with a **Launcher** tab plus the Plant, Scenario, Run, AI health and PLC tabs, all on the same plant. The Launcher tab also manages designs and snapshots and starts external programs (offline/TwinCAT runtime, AI training, live watchdog, tests) |
 | Back up or share a plant design | Launcher: **Export design to file...** / **Import design from file...** (JSON, layout only) |
 | Save or resume a plant's running state | Launcher: select a snapshot (restored when a runtime starts) and fill *Save on stop as*; or **Save/Load snapshot** on the Run tab; snapshots can be exported/imported as JSON |
@@ -304,11 +305,12 @@ are drawn as simplified vector shapes. Pipe `length` is not yet derived from the
 | `evaporator` | EvapRate; heater `scaling` |
 | `dryer` | AirCmd, Moisture; hot-air drying, `thermal_damage` state |
 | `distillation_column` | HeaterCmd, RefluxCmd, TopTemp, BottomTemp, Boilup, DrumLevel, ColumnDp, Flooding; ports `feed`, `bottoms`, `distillate`; faults flooding, weeping, tray `fouling`, reboiler `scaling` |
+| `pfr` | Jacketed tubular reactor (a CSTR subclass with a small holdup); same cooling signals as the CSTR; jacket `fouling` fault. Lumped: no axial profile or hot spot |
 
 The column uses equilibrium stages with Murphree efficiency, constant molar overflow, a reboiler and a
 total condenser. For realistic ethanol-water use `thermo.set_activity_model(thermo.nrtl_model({...}))`
 (Raoult is the default). Simplifications: no feed enthalpy balance, constant efficiency, instant liquid
-travel between trays, total condenser only. Not built yet: plug-flow reactor, filter, crystallizer,
+travel between trays, total condenser only. Not built yet: a spatially resolved plug-flow reactor, filter, crystallizer,
 absorber. Hooks for new units: `Transfer.condition_liquid` (change a stream passing an edge element) and
 `ProcessEquipment.draw_at/receive_at/max_outflow_at/max_inflow_at` (per-port behaviour).
 
@@ -419,12 +421,66 @@ is marked as having no acceptable alert threshold and defaults to no alert rathe
 Validation and test results are required before treating any threshold as operational.
 
 `RiskModel` is gradient-boosted trees by default (`Modules/Watchdog/trees.py`, numpy only); use `--model logistic`
-for the linear baseline. The window and sampling period are controlled by `--window` and `--period`. The
-synthetic generator varies measurement noise and random-walk drift, suction-valve and hot-liquid cavitation,
-gradual grid-voltage drift, baseline operation, and two valve-placement layouts. It deliberately excludes
-unpredictable scheduled grid dips from stop-prediction
-training: an unannounced future event has no pre-event signal to learn from. Those scenarios remain useful for
-PLC alarm/recovery validation, not prediction claims.
+for the linear baseline. The window and sampling period are controlled by `--window` and `--period`.
+
+**Synthetic training data.** `Modules/Watchdog/scenarios.py` generates reproducible "bad days" and
+`Modules/Watchdog/faults.py` shapes each fault in time. Variety is deliberate so the model learns faults, not
+scenarios:
+
+- *Plant families:* `loop` (tank, pump, valve, line), `transfer` (two tanks with a gravity return), `heated`
+  (the loop plus a heat exchanger under temperature control), `reactor` (feed tank, pump, valve, a jacketed CSTR
+  running the exothermic `A + B -> C` reaction, drain) and `tubular` (the same with a small-holdup jacketed PFR that
+  heats up in seconds). The reactor families have a PI cooling-water loop (`XV210`, reactor temperature `TT201`)
+  and a high-high temperature interlock that trips the feed pump. The jacket is auto-sized to the feed so a
+  healthy plant sits at a 30-60 % open cooling valve. The valve may be on the suction or discharge side.
+- *Failure modes (17):* suction-valve, hot-liquid and intermittent cavitation, grid-voltage drift, line fouling, line
+  blockage, tank leak, pump wear, a seized valve, heater runaway, **loss of reactor cooling** (cooling valve
+  seizes), **coolant-side fouling** (hidden `fouling` on the reactor jacket) and **warm cooling water**, plus
+  two-fault compounds. A continuous reactor has no true thermal runaway (depletion and throughput limit it), so
+  the reactor modes show up as slow temperature rises that reach the interlock only sometimes; the rest are
+  realistic non-stop data. Fault-free days
+  (`benign_transients`: operator speed/setpoint changes and brownouts; `sensor_nuisance`: spikes, freezes and
+  calibration offsets) and clean `baseline` days must **not** raise alarms and count as false alarms if they do.
+- *Fault shape:* each fault draws a ramp, accelerating, sudden step, saw-tooth (cleaned then regrows) or sporadic
+  burst profile with a random onset, speed and size, so "the fault starts at minute X" cannot be learned.
+- *Instrument and control realism:* per-episode noise, drift, lag, calibration offset, outlier spikes, frozen
+  readings and valve stiction (`OperatorView` applies them), plus PI flow and temperature loops and operator actions.
+- *Labels:* the stop label is the PLC-visible `P101.Fault`. `TRUTH.FaultActive` marks the fault onset for evaluation
+  only and is never a model input (`dataset.py`/`training.py` drop `TRUTH.*` and `EVENT.*`).
+
+**Normal-only detector and the campaign plant.** Failure data is scarce, healthy data is not, so training also fits
+a `SubspaceDetector` on fault-free episodes only (`model.py`; saved next to the model as `<name>.anomaly.npz`).
+Its score is 1.0 at the edge of normal; a validation-selected threshold under the same false-alarm budget is
+stored in the model metadata (`selected_anomaly_threshold`) and `run_watchdog.py` prints an *advisory* when the
+plant looks unlike normal operation, which can flag failure types never seen in training. Training reports its
+held-out numbers as `anomaly_test_*` beside the supervised `test_*`. Plants differ in their sensors, so the model
+uses the union of channels; a channel a plant lacks reads 0.0 (`optional_channels` in the model).
+
+`scenarios.run_campaign(seed, hours)` is the "training plant": one plant living through several incidents at
+random times, each with its own shape and severity, under a day/night and seasonal ambient cycle. After a trip
+(or when an incident ends) a simulated operator repairs everything, refills the feed tank and restarts the pump
+once a hot reactor has cooled. `python Runtimes\train_watchdog.py --campaigns 24 --workers 8` adds these long
+runs to training (and a third as many to validation and test).
+
+**Claim, stated plainly.** All training and test data here is synthetic. The measurable claim is "detects
+seeded faults X minutes before a trip at Y false alarms per hour on held-out simulated plants", not "predicts
+real plant accidents". Public sets (Tennessee Eastman, SWaT) have different tags, so they serve as an external
+benchmark of the method through the CSV path, not as training data for this plant.
+
+Unannounced scheduled grid dips stay out of the stop-prediction labels: an unannounced future event has no
+pre-event signal to learn from. They remain useful for PLC alarm/recovery validation.
+
+**Large training sets.** `Modules/Watchdog/corpus.py` generates episodes once, in parallel, into a folder of `.npz`
+files (one per seed; episodes from another generator version, length or sample period are regenerated, so stale
+files are never mixed in). Use it from the trainer:
+
+```powershell
+python Runtimes\train_watchdog.py --episodes 400 --validation-episodes 100 --test-episodes 100 --corpus Data\corpus --workers 8
+```
+
+The default in-memory run (40/20/20 episodes) takes about 7 minutes on one core; `--corpus` with `--workers` makes
+repeat and larger runs practical. `Data/corpus/` is gitignored. Bump `GENERATOR_VERSION` in `scenarios.py` whenever
+the generator's behaviour changes.
 
 Product-readiness limits remain material: the synthetic dataset is a small reference pump-loop study, not
 evidence of generalization across real plants; lab channels are used by the GUI health monitor when results are
@@ -432,13 +488,32 @@ released, but are not yet part of the trained/live ADS watchdog data pipeline; a
 sensor/lab-driven anomaly estimate, not the supervised predictor. Validate with independent historian data,
 asset/failure-specific targets, and operator-reviewed alarm policies before any operational use.
 
-**Current v2 baseline result (seeded default run, 40 training / 20 validation / 20 test episodes):** held-out
-ROC AUC 0.908, but the validation-selected threshold detected only 1 of 10 test trips (10% event recall), with
-2 false alarm episodes (0.074/hour) and 245 s median lead on the single detected trip. It detected 1/5
-suction-valve cavitation trips and none of the 3 hot-liquid cavitation or 2 grid-drift trips. A high AUC here
-does not make the detector operationally useful; the low event recall is a product-readiness blocker, not a
-success claim. The result is reproducible with the default episode ranges and should be re-measured after any
-training or feature changes.
+**Slow degradation (generator v5).** The reactor and tubular families now end in a long, poorly insulated product
+line (`L201`, with `PT201`/`PT202` before and after it). The new `wall_scaling` mode makes the product C less soluble
+when cold (set per episode, restored afterwards) and ramps the line's deposition rate from zero: the real
+`Pipe.slow_update` chemistry then plates C onto the cold wall. The result is slow: flow sags over tens of
+minutes, the pressure after the line falls, and about half the episodes eventually trip on low flow. No
+degradation variable is visible to the AI; it sees only the transmitters.
+
+**Current v5 result (generator v5: 18 failure modes, five plant families, 340 training / 68 validation / 68 test
+episodes plus 32 eight-hour training campaigns and held-out campaigns; 196 held-out operating hours):** the
+supervised model reaches test ROC AUC 0.85 and detected 12 of 36 trips (33 % event recall, median lead 128 s) at
+0.041 false alarms/hour (budget 0.1). The normal-only detector caught 1 of 36 (AUC 0.76, 0.031 false alarms/hour),
+so it remains an advisory only. Slow modes are still the weakest; counts are small, so treat these as direction
+only and re-measure after any generator, feature or training change.
+
+**Previous v4 result (generator v4: five plant families, 17 failure modes, plus 24 six-hour campaigns in training;
+255 training / 51 validation / 51 test episodes plus 8 test campaigns, 126 held-out operating hours):** the
+supervised model reaches test ROC AUC 0.77 and, at its validation-selected threshold (0.89), detected 10 of 45
+trips (22 % event recall, median lead 232 s) at 0.103 false alarms/hour (budget 0.1; precision 0.44). The
+normal-only detector has a similar AUC (about 0.74 on the episode-only test set) but at a threshold that keeps
+false alarms within budget (0.024/hour) it caught 1 of 45 trips, so as built it is an advisory, not a predictor.
+The supervised model's catches concentrate on cavitation, heater-runaway and some cooling-loss/leak trips; blockage,
+fouling, grid drift, pump wear and the slow reactor modes were mostly missed. This is lower than the v3 figure
+(5 of 8) because the test distribution is now far broader (reactor families, campaigns), not because the model
+got worse; the two are not comparable. Counts are small, so treat them as direction only. Next levers: longer
+horizons or trend features for slow degradation, per-family thresholds, and training the detector per family.
+Re-measure with a larger corpus after any generator, feature or training change.
 
 **Leaks and blockages from sensor differences.** `Modules/Watchdog/residuals.py` finds flow sensors on the same unbranched line and differential-pressure/flow pairs in a stored plant and adds `RES.*.balance` (flow in minus flow out) and `RES.*.resistance` (dP against flow squared) channels. `ResidualMonitor` is fitted on healthy data only and returns a z-score (above 5 = alarm) with the worst channel. Pass `--plant NAME` together with `--csv` to add these channels to recordings.
 

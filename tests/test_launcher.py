@@ -127,6 +127,30 @@ class DemoPlantTests(unittest.TestCase):
             ScenarioPlayer(plant, bad).update()
 
 
+class TrainingPlantTests(unittest.TestCase):
+    def test_reactor_training_plant_builds_runs_and_scales(self):
+        from Data.build_training_plant import build_training_plant
+        from Data.scenarios import load_scenario
+        from Modules.Scenario.scenario import ScenarioPlayer
+        session = Session(create_engine("sqlite://", poolclass=StaticPool))
+        try:
+            name = build_training_plant(session)
+            self.assertFalse(PlantDocument(session, name).needs_layout())
+            plant = load_plant(session, name)
+            plant.slow_time_scale = 1000.0
+            player = ScenarioPlayer(plant, load_scenario(session, name, "Wall scaling"))
+            for _ in range(2 * 3600):
+                player.update()
+                plant.step(0.5)
+            eq = plant.equipment
+            self.assertTrue(eq["P401"].running and eq["P402"].running)
+            self.assertGreater(eq["PL402"].fouling, 0.02)         # C plates out on the cold wall
+            self.assertLess(eq["PL404"].fouling, 0.01)            # the other line is untouched
+            self.assertFalse(any(getattr(e, "tripped", False) for e in eq.values()))
+        finally:
+            session.close()
+
+
 class LauncherWindowTests(unittest.TestCase):
     def test_auto_layout_spreads_nodes_by_flow(self):
         session = Session(create_engine("sqlite://", poolclass=StaticPool))

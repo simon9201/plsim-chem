@@ -20,6 +20,8 @@ from Modules.Entity.Process_equipment.transfer import Transfer
 # supply makes the pump draw more current and run hotter, it loses speed below 90 % voltage, and it
 # trips on undervoltage / overtemperature. Long hot running ages the insulation until the motor burns
 # out (permanent until repair). Signals: Current, WindingTemp, Voltage, Vibration.
+# Optional protection relays (off by default): `low_flow_trip_time` trips a pump that runs too long below
+# `low_flow_fraction` of max flow (blocked discharge or suction), `vibration_trip` one that shakes too hard.
 # =====================================================================
 
 CAVITATION_HEAD_LOSS = 0.6
@@ -35,9 +37,16 @@ class Pump(Transfer):
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  shutoff_head=3.0, max_flow=6.0, ramp_time=2.0, dry_run_trip=2.0,
-                 npsh_required=0.3, cavitation_trip=10.0, rated_kw=2.2):
+                 npsh_required=0.3, cavitation_trip=10.0, rated_kw=2.2,
+                 low_flow_trip_time=0.0, low_flow_fraction=0.15, vibration_trip=0.0, vibration_trip_time=60.0):
         super().__init__(name, description, status, inlets, outlets)
         self.motor = Motor(rated_kw)
+        self.low_flow_trip_time = low_flow_trip_time      # s below low_flow_fraction of max_flow before a trip (0 = off)
+        self.low_flow_fraction = low_flow_fraction
+        self.vibration_trip = vibration_trip              # mm/s (0 = off)
+        self.vibration_trip_time = vibration_trip_time
+        self.low_flow_time = 0.0
+        self.vibration_time = 0.0
         self.shutoff_head = shutoff_head
         self.max_flow = max_flow
         self.ramp_time = ramp_time
@@ -89,6 +98,20 @@ class Pump(Transfer):
         vibration = 4.0 * self.wear + 3.0 * self.cavitation + (1.5 if self.deadheading else 0.0)
         if self.motor.update(dt, load, self.running, vibration):
             self.tripped = True
+        self._protect(dt)
+
+    def _protect(self, dt):
+        """Optional protection relays (off unless configured): low flow for too long, vibration too high for too long."""
+        if self.low_flow_trip_time > 0:
+            low = self.running and self.speed >= 99.0 and abs(self.flow) < self.low_flow_fraction * self.max_flow
+            self.low_flow_time = self.low_flow_time + dt if low else max(0.0, self.low_flow_time - dt)
+            if self.low_flow_time >= self.low_flow_trip_time:
+                self.tripped = True
+        if self.vibration_trip > 0:
+            high = self.running and self.motor.vibration > self.vibration_trip
+            self.vibration_time = self.vibration_time + dt if high else max(0.0, self.vibration_time - dt)
+            if self.vibration_time >= self.vibration_trip_time:
+                self.tripped = True
 
     def repair(self):
         """Overhaul: new wear parts and a new motor winding. A trip stays until the PLC sends ResetCmd, like on a real pump."""
@@ -132,6 +155,7 @@ class Pump(Transfer):
             self.tripped = False
             self.dry_time = 0.0
             self.cavitation_time = 0.0
+            self.low_flow_time = self.vibration_time = 0.0
 
     def signals(self):
         return [
@@ -151,7 +175,8 @@ class Pump(Transfer):
         return {"run_cmd": bool(self.run_cmd), "speed_sp": float(self.speed_sp), "speed": float(self.speed),
                 "tripped": bool(self.tripped), "dry_time": float(self.dry_time),
                 "cavitation": float(self.cavitation), "cavitation_time": float(self.cavitation_time),
-                "wear": float(self.wear), "motor": self.motor.get_state()}
+                "wear": float(self.wear), "low_flow_time": float(self.low_flow_time),
+                "vibration_time": float(self.vibration_time), "motor": self.motor.get_state()}
 
     def set_state(self, state):
         self.run_cmd, self.speed_sp, self.speed = state["run_cmd"], state["speed_sp"], state["speed"]
@@ -159,6 +184,8 @@ class Pump(Transfer):
         self.cavitation = state.get("cavitation", 0.0)
         self.cavitation_time = state.get("cavitation_time", 0.0)
         self.wear = state.get("wear", 0.0)
+        self.low_flow_time = state.get("low_flow_time", 0.0)
+        self.vibration_time = state.get("vibration_time", 0.0)
         self.motor.set_state(state.get("motor", {}))
         self._last_speed_written = 0.0
 

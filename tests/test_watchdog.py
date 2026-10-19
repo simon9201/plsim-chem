@@ -170,6 +170,24 @@ class ModelTests(unittest.TestCase):
         d.fit(rng.normal(size=(300, 3)))
         self.assertGreater(d.score(np.array([[10.0, 0, 0]]))[0], d.score(np.zeros((1, 3)))[0])
 
+    def test_subspace_detector_separates_and_round_trips(self):
+        from Modules.Watchdog.model import SubspaceDetector, anomaly_path
+        rng = np.random.default_rng(2)
+        base = rng.normal(size=(400, 2))
+        healthy = np.hstack([base, base @ rng.normal(size=(2, 4)) + 0.05 * rng.normal(size=(400, 4))])
+        d = SubspaceDetector(["a"], [f"f{i}" for i in range(6)], 10, 5.0, 60.0, "T.Fault").fit(healthy)
+        odd = healthy[:20].copy()
+        odd[:, 3] += 6.0          # breaks the learned correlation
+        self.assertGreater(d.score(odd).mean(), 1.0)
+        self.assertLess(np.median(d.score(healthy)), 1.0)
+        with tempfile.TemporaryDirectory() as folder:
+            path = anomaly_path(os.path.join(folder, "m.npz"))
+            d.save(path)
+            loaded = SubspaceDetector.load(path)
+        np.testing.assert_allclose(loaded.score(odd), d.score(odd))
+        with self.assertRaises(ValueError):
+            SubspaceDetector(["a"], ["f"], 10, 5.0, 60.0, "T.Fault").fit(healthy[:5])
+
 
 class RecorderAndWatchdogTests(unittest.TestCase):
     def test_recorder_period_and_csv(self):
@@ -223,7 +241,104 @@ class RecorderAndWatchdogTests(unittest.TestCase):
             w.update(0.5, {"a": 1.0})
 
 
+class CorpusTests(unittest.TestCase):
+    def test_build_is_resumable_and_regenerates_stale_episodes(self):
+        from Modules.Watchdog.corpus import build_corpus, load_corpus
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(build_corpus(folder, range(2), max_seconds=60.0), 2)
+            self.assertEqual(build_corpus(folder, range(3), max_seconds=60.0), 1)      # only the new seed
+            self.assertEqual(build_corpus(folder, range(3), max_seconds=90.0), 3)      # different length: stale
+            records = load_corpus(folder, range(3))
+            self.assertEqual(len(records), 3)
+            (mode, family), (times, matrix, names) = records[0]
+            self.assertIn("P101.Fault", names)
+            self.assertEqual(matrix.shape, (len(times), len(names)))
+            with self.assertRaises(FileNotFoundError):
+                load_corpus(folder, [99])
+
+    def test_corpus_matches_direct_simulation_and_trains(self):
+        from Modules.Watchdog.corpus import generate_recordings
+        from Modules.Watchdog.scenarios import run_episode
+        from Modules.Watchdog.training import collect_recordings
+        with tempfile.TemporaryDirectory() as folder:
+            cached = collect_recordings([3, 4], max_seconds=60.0, corpus=folder)
+            direct = [run_episode(s, max_seconds=60.0) for s in (3, 4)]
+            for (mode, (t, m, n)), (t2, m2, n2) in zip(cached, direct):
+                self.assertIsInstance(mode, str)            # JSON-friendly label for the metrics
+                self.assertEqual(n, n2)
+                np.testing.assert_allclose(m, m2, rtol=1e-5, atol=1e-5)
+        self.assertEqual(len(generate_recordings([3], max_seconds=60.0)), 1)
+
+
 class ScenarioTests(unittest.TestCase):
+    def test_every_mode_and_family_runs_and_stays_finite(self):
+        from Modules.Watchdog.scenarios import FAILURE_MODES, FAMILIES, MODE_FAMILIES, run_episode
+        for mode in FAILURE_MODES:
+            for family in MODE_FAMILIES.get(mode, FAMILIES):
+                _, matrix, names = run_episode(11, max_seconds=120.0, failure_mode=mode, family=family)
+                self.assertTrue(np.isfinite(matrix).all(), f"{mode}/{family}")
+
+    def test_episodes_are_reproducible_for_a_seed(self):
+        from Modules.Watchdog.scenarios import run_episode
+        a = run_episode(5, max_seconds=120.0)
+        b = run_episode(5, max_seconds=120.0)
+        np.testing.assert_array_equal(a[1], b[1])
+
+    def test_fault_profiles_are_bounded_and_start_at_zero(self):
+        import random
+        from Modules.Watchdog.faults import KINDS, Profile
+        for kind in KINDS:
+            p = Profile(kind, 100.0, 0.8, 600.0, random.Random(1), 7200.0)
+            self.assertEqual(p(50.0), 0.0)
+            self.assertTrue(all(0.0 <= p(t) <= 0.8 + 1e-9 for t in range(0, 7200, 30)), kind)
+        with self.assertRaises(ValueError):
+            Profile("nonsense", 0, 1, 1, random.Random(1), 10)
+
+    def test_reactor_families_hold_setpoint_and_cooling_loss_can_trip(self):
+        from Modules.Watchdog.scenarios import run_episode
+        for family in ("reactor", "tubular"):
+            _, matrix, names = run_episode(3, max_seconds=900.0, failure_mode="baseline", family=family)
+            self.assertIn("TT201.Value", names)
+            self.assertTrue(np.isfinite(matrix).all())
+            self.assertEqual(matrix[:, names.index("P101.Fault")].max(), 0.0, family)
+
+    def test_wall_scaling_is_gradual_and_restores_the_chemistry(self):
+        from Modules.Flow.chemistry import COMPONENTS
+        from Modules.Watchdog.scenarios import run_episode
+        before = COMPONENTS["C"]
+        _, matrix, names = run_episode(2, max_seconds=3600.0, failure_mode="wall_scaling", family="reactor")
+        self.assertIs(COMPONENTS["C"], before)               # the per-episode solubility is undone
+        self.assertTrue(np.isfinite(matrix).all())
+        self.assertIn("PT202.Value", names)
+        flow = matrix[:, names.index("FT101.Value")]
+        n = len(flow)
+        self.assertLess(flow[-n // 10:].mean(), flow[n // 10: n // 5].mean())     # the line narrows
+        self.assertGreater(flow[-n // 10:].mean(), 0.3 * flow[n // 10: n // 5].mean())   # but only gradually
+
+    def test_campaign_has_incidents_repairs_and_is_reproducible(self):
+        from Modules.Watchdog.scenarios import run_campaign
+        log = []
+        times, matrix, names = run_campaign(1, hours=3.0, family="loop", log=log)
+        self.assertTrue(np.isfinite(matrix).all())
+        self.assertGreaterEqual(len(log), 1)
+        self.assertTrue(all(i["end"] > i["start"] for i in log))
+        truth = matrix[:, names.index("TRUTH.FaultActive")]
+        self.assertGreater(truth.max(), 0.0)
+        self.assertEqual(truth[-1] if log[-1]["end"] < times[-1] else 0.0, 0.0)
+        again = run_campaign(1, hours=3.0, family="loop")
+        np.testing.assert_array_equal(matrix, again[1])
+
+    def test_watchdog_fills_optional_channels_that_a_plant_lacks(self):
+        m = RiskModel(["a", "b"], ["f"], 3, 1.0, 5.0, "T.Fault", "logistic", ["b"])
+        rng = np.random.default_rng(0)
+        m.fit(np.vstack([window_features(rng.normal(size=(3, 2))) for _ in range(50)]), rng.integers(0, 2, 50))
+        wd = Watchdog(m)
+        for t in range(5):
+            wd.update(float(t), {"a": 1.0})
+        self.assertTrue(wd.history)
+        with self.assertRaises(KeyError):
+            Watchdog(m).update(0.0, {"b": 1.0})
+
     def test_episode_and_training_beat_chance(self):
         from Modules.Watchdog.training import train_watchdog
         result = train_watchdog(train_seeds=range(0, 8), test_seeds=range(100, 104))

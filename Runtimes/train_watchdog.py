@@ -11,11 +11,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from Modules.Watchdog.model import anomaly_path
 from Modules.Watchdog.recorder import load_csv, plant_sampler
 from Modules.Watchdog.scenarios import FAILURE_MODES, LAYOUTS, TARGET, build_plant, run_episode
 from Modules.Watchdog.dataset import rising_edges
-from Modules.Watchdog.training import (_evaluate_recordings, fit, parts_from_recordings, select_alarm_threshold,
-                                       train_watchdog)
+from Modules.Watchdog.training import (_evaluate_recordings, fit, optional_channels, parts_from_recordings,
+                                       select_alarm_threshold, train_watchdog)
 from Modules.Watchdog.watchdog import Watchdog
 
 
@@ -35,6 +36,11 @@ def _file_provenance(path):
 # Train the stop-prediction watchdog and save it (a .npz file the live watchdog loads).
 #
 #   python Runtimes\train_watchdog.py                      simulated "bad day" episodes (Modules/Watchdog/scenarios.py)
+#   python Runtimes\train_watchdog.py --episodes 400 --corpus Data\corpus --workers 8
+#                                                          the same, generated once in parallel and cached (corpus.py)
+#   python Runtimes\train_watchdog.py --campaigns 24 --workers 8
+#                                                          also train on long runs where incidents arrive at random
+#                                                          times under day/night weather (scenarios.run_campaign)
 #   python Runtimes\train_watchdog.py --csv a.csv b.csv --target P101.Fault
 #                                                          recordings made with run_plant.py --record
 # Afterwards it replays one unseen simulated episode and reports how early the alarm came before the stop.
@@ -77,6 +83,11 @@ def main():
     ap.add_argument("--validation-episodes", type=int, default=20,
                     help="synthetic episodes used to select an alert threshold")
     ap.add_argument("--test-episodes", type=int, default=20, help="simulated episodes held out for evaluation")
+    ap.add_argument("--corpus", help="folder caching the simulated episodes (built once, reused, e.g. Data\\corpus)")
+    ap.add_argument("--workers", type=int, default=1, help="parallel processes for generating episodes")
+    ap.add_argument("--campaigns", type=int, default=0,
+                    help="long multi-incident 'training plant' runs added to training (a third as many to validation/test)")
+    ap.add_argument("--campaign-hours", type=float, default=6.0, help="simulated hours per campaign")
     ap.add_argument("--csv", nargs="*", help="train from recordings instead of simulating")
     ap.add_argument("--validation-csv", nargs="*", help="separate historian recordings for threshold selection")
     ap.add_argument("--test-csv", nargs="*", help="independent historian recordings for held-out evaluation")
@@ -101,7 +112,8 @@ def main():
         if args.plant:
             recordings = add_plant_residuals(recordings, args.plant)
         parts, channels = parts_from_recordings(recordings, args.target, args.horizon, args.window)
-        model, detector, metrics = fit(parts, channels, args.window, args.period, args.horizon, args.target, args.model)
+        model, detector, metrics = fit(parts, channels, args.window, args.period, args.horizon, args.target, args.model,
+                                       optional=optional_channels(recordings, args.target))
         training_sources["training_csv"] = [
             _file_provenance(p) for p in args.csv]
         if args.validation_csv:
@@ -147,10 +159,13 @@ def main():
         model, detector, metrics = train_watchdog(train_seeds, test_seeds, args.target, args.horizon, args.window, 3,
                                                   args.period, kind=args.model, alarm_threshold=args.alarm_threshold,
                                                   validation_seeds=validation_seeds,
-                                                  max_false_alarms_per_hour=args.max_false_alarms_per_hour)
+                                                  max_false_alarms_per_hour=args.max_false_alarms_per_hour,
+                                                  corpus=args.corpus, workers=args.workers,
+                                                  campaigns=args.campaigns, campaign_hours=args.campaign_hours)
         selected_threshold = metrics["selected_alarm_threshold"]
         training_sources = {"kind": "synthetic", "train_seeds": train_seeds,
                             "validation_seeds": validation_seeds, "test_seeds": test_seeds,
+                            "campaigns": args.campaigns, "campaign_hours": args.campaign_hours,
                             "failure_modes": list(FAILURE_MODES), "layouts": list(LAYOUTS)}
     for key, value in metrics.items():
         if isinstance(value, float):
@@ -172,10 +187,16 @@ def main():
         "model_metrics": metrics,
         "evaluation_note": "Risk score is not a calibrated probability; validation metrics require representative, held-out data.",
         "selected_alarm_threshold": selected_threshold,
+        "selected_anomaly_threshold": metrics.get("selected_anomaly_threshold", 0.75),
         "false_alarm_budget_per_hour": args.max_false_alarms_per_hour,
     }
     model.save(args.out)
     print(f"Saved model to {args.out}")
+    if detector is not None:
+        detector.save(anomaly_path(args.out))
+        print(f"Saved normal-only detector to {anomaly_path(args.out)}")
+    elif os.path.exists(anomaly_path(args.out)):
+        os.remove(anomaly_path(args.out))     # never leave a detector that belongs to an older model
     if not args.csv:
         for seed in range(2000, 2006):
             replay(model, detector, seed, selected_threshold)

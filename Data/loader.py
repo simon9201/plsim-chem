@@ -13,6 +13,7 @@ from Modules.Editor.document import METERS_PER_UNIT
 from Modules.Plant.plant_model import PlantModel
 from Modules.Entity.Process_equipment.Vessel.StorageTank.storage_tank import StorageTank
 from Modules.Entity.Process_equipment.Vessel.Reactor.CSTR.CSTR import ContinuousStirredTankReactor
+from Modules.Entity.Process_equipment.Vessel.Reactor.PFR.PFR import PlugFlowReactor
 from Modules.Entity.Process_equipment.Vessel.FlashDrum.flash_drum import FlashDrum
 from Modules.Entity.Process_equipment.Gas.gas import (GasVolume, GasSource, GasSink, GasPipe, GasValve,
                                                       GasCheckValve, Compressor)
@@ -35,6 +36,7 @@ from Modules.Entity.Instrument.Analyzer_sensor.Analyzer_sensor import AnalyzerSe
 EQUIPMENT_TYPES = {
     "storage_tank": StorageTank,
     "cstr": ContinuousStirredTankReactor,
+    "pfr": PlugFlowReactor,
     "pump": Pump,
     "valve": Valve,
     "check_valve": CheckValve,

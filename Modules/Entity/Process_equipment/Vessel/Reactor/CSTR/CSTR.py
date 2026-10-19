@@ -24,6 +24,13 @@ class ContinuousStirredTankReactor(Reactor):
         self.cooling_command = cooling_command  # 0..1, used when no cooling valve is linked
         self.cooling_valve = None               # a UtilityValve, linked by the loader
         self.cooling_duty = 0.0                 # W removed during the last step
+        self.fouling = 0.0                      # 0..1 hidden condition: the jacket/coil scales up and removes less heat
+
+    FAULTS = Reactor.FAULTS + ("fouling",)
+
+    def repair(self):
+        self.fouling = 0.0
+        super().repair()
 
     @property
     def cooling_fraction(self):
@@ -44,7 +51,7 @@ class ContinuousStirredTankReactor(Reactor):
         self.cooling_duty = 0.0
         if cp > 0:
             old_temperature = self.temperature
-            ua = self.cooling_ua * self.cooling_fraction
+            ua = self.cooling_ua * self.cooling_fraction * (1.0 - min(1.0, max(0.0, self.fouling)))
             self.contents.temperature = self.coolant_temp + (old_temperature - self.coolant_temp) * math.exp(
                 -ua * dt / cp)
             self.cooling_duty = cp * (old_temperature - self.temperature) / dt
@@ -52,8 +59,10 @@ class ContinuousStirredTankReactor(Reactor):
     def get_state(self):
         state = super().get_state()
         state["cooling_command"] = float(self.cooling_command)
+        state["fouling"] = float(self.fouling)
         return state
 
     def set_state(self, state):
         super().set_state(state)
         self.cooling_command = state["cooling_command"]
+        self.fouling = state.get("fouling", 0.0)

@@ -22,8 +22,9 @@ class Report:
     time: float
     risk: float                 # 0..1 model score
     alarm: bool
-    anomaly: float = 0.0        # z-score of the window against healthy data (0 if no detector)
+    anomaly: float = 0.0        # normal-only detector score, 1.0 = edge of healthy behaviour (0 if no detector)
     reasons: list = field(default_factory=list)     # [(feature, contribution)] driving the risk
+    anomaly_alarm: bool = False  # advisory: the window looks unlike anything healthy (needs a detector)
 
 
 def alarm_transitions(scores, alarm_threshold, clear_threshold=0.5, alarm_samples=2, clear_samples=3):
@@ -51,9 +52,14 @@ def alarm_transitions(scores, alarm_threshold, clear_threshold=0.5, alarm_sample
 
 class Watchdog:
     def __init__(self, model, anomaly=None, alarm_threshold=0.8, clear_threshold=0.5, alarm_samples=2,
-                 clear_samples=3):
+                 clear_samples=3, anomaly_threshold=None):
         self.model = model
         self.anomaly = anomaly
+        # advisory flag of the normal-only detector; its score is on a 0..inf scale where 1.0 is the edge of normal
+        self.anomaly_threshold = 1.0 if anomaly_threshold is None else float(anomaly_threshold)
+        self.anomaly_alarm = False
+        self._anomaly_above = 0
+        self._anomaly_below = 0
         self.alarm_threshold = alarm_threshold
         self.clear_threshold = clear_threshold
         if alarm_samples < 1 or clear_samples < 1:
@@ -79,8 +85,10 @@ class Watchdog:
             raise ValueError("Watchdog sample time moved backwards")
         if t - self._last_t < self.model.period - 1e-9:
             return None
+        optional = set(getattr(self.model, "optional_channels", ()) or ())
         try:
-            row = [float(values[c]) for c in self.model.channels]
+            row = [float(values[c]) if c not in optional else float(values.get(c, 0.0))
+                   for c in self.model.channels]
         except KeyError as err:
             raise KeyError(f"Watchdog input is missing channel {err}") from None
         if not np.isfinite(row).all():
@@ -104,6 +112,18 @@ class Watchdog:
                 self.alarm = True
                 self._above_count = self._below_count = 0
         anomaly = float(self.anomaly.score(x)[0]) if self.anomaly is not None else 0.0
-        report = Report(t, risk, self.alarm, anomaly, self.model.explain(x) if self.alarm else [])
+        if self.anomaly is not None:
+            if self.anomaly_alarm:
+                self._anomaly_below = self._anomaly_below + 1 if anomaly < 0.8 * self.anomaly_threshold else 0
+                if self._anomaly_below >= self.clear_samples:
+                    self.anomaly_alarm = False
+                    self._anomaly_above = self._anomaly_below = 0
+            else:
+                self._anomaly_above = self._anomaly_above + 1 if anomaly >= self.anomaly_threshold else 0
+                if self._anomaly_above >= self.alarm_samples:
+                    self.anomaly_alarm = True
+                    self._anomaly_above = self._anomaly_below = 0
+        report = Report(t, risk, self.alarm, anomaly, self.model.explain(x) if self.alarm else [],
+                        self.anomaly_alarm)
         self.history.append(report)
         return report

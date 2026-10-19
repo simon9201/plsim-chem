@@ -15,7 +15,7 @@ from Data.database import get_engine
 from Data.tags import load_tags
 from Modules.Entity.Entity import TO_PLC
 from Modules.PLC.bridge import AdsLink, LinkError
-from Modules.Watchdog.model import RiskModel
+from Modules.Watchdog.model import RiskModel, SubspaceDetector, anomaly_path
 from Modules.Watchdog.recorder import SignalRecorder, link_sampler
 from Modules.Watchdog.watchdog import Watchdog
 
@@ -47,7 +47,8 @@ def main():
     with Session(get_engine()) as session:
         tags = load_tags(session, args.plant)
     known = {f"{t.entity_tag}.{t.signal}" for t in tags if t.direction == TO_PLC}
-    missing = [c for c in model.channels if c not in known]
+    optional = set(getattr(model, "optional_channels", ()) or ())
+    missing = [c for c in model.channels if c not in known and c not in optional]
     if missing:
         sys.exit(f"The model needs channels that are not PLC feedback tags in plant '{args.plant}': {missing}")
     if model.target not in known:
@@ -58,10 +59,15 @@ def main():
     threshold = args.alarm_threshold
     if threshold is None:
         threshold = model.metadata.get("selected_alarm_threshold", 0.8)
-    watchdog = Watchdog(model, alarm_threshold=threshold)
+    detector = None
+    if os.path.exists(anomaly_path(args.model)):
+        detector = SubspaceDetector.load(anomaly_path(args.model))
+    watchdog = Watchdog(model, detector, alarm_threshold=threshold,
+                        anomaly_threshold=model.metadata.get("selected_anomaly_threshold"))
     recorder = SignalRecorder(model.period) if args.record else None
     start = time.monotonic()
     alarm = False
+    anomaly_alarm = False
     metadata = model.metadata
     try:
         link.connect()
@@ -97,6 +103,11 @@ def main():
                           f"(risk {report.risk:.2f}). Main drivers: {why}")
                 else:
                     print(f"[{t:8.0f} s] risk back to normal ({report.risk:.2f})")
+            if report and report.anomaly_alarm != anomaly_alarm:
+                anomaly_alarm = report.anomaly_alarm
+                print(f"[{t:8.0f} s] ADVISORY: plant behaviour is "
+                      + (f"unlike normal operation (score {report.anomaly:.2f}); no known failure pattern implied"
+                         if anomaly_alarm else "back within the normal envelope"))
             time.sleep(model.period)
     except (KeyboardInterrupt, LinkError) as err:
         print("Stopped" if isinstance(err, KeyboardInterrupt) else f"Stopped: {err}")

@@ -368,6 +368,19 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(water.attributes["freezing_point_c"], 0.0)
             self.assertEqual(water.attributes["custom"], "keep")
 
+    def test_pfr_is_a_small_holdup_reactor_whose_jacket_fouls_and_repairs(self):
+        from Modules.Entity.Process_equipment.Vessel.Reactor.PFR.PFR import PlugFlowReactor
+        pfr = PlugFlowReactor("TR", inlets=["in"], outlets=["out"], tube_volume=80.0)
+        self.assertAlmostEqual(pfr.contents.volume, 80.0)
+        pfr.fouling = 0.7
+        self.assertIn("fouling", pfr.FAULTS)
+        state = pfr.get_state()
+        clone = PlugFlowReactor("TR", inlets=["in"], outlets=["out"], tube_volume=80.0)
+        clone.set_state(state)
+        self.assertEqual(clone.fouling, 0.7)
+        clone.repair()
+        self.assertEqual(clone.fouling, 0.0)
+
     def test_cooling_remains_bounded_for_large_steps(self):
         reactor = ContinuousStirredTankReactor(
             "R", inlets=["in"], outlets=["out"], initial_volume=100.0,

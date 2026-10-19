@@ -33,6 +33,8 @@ EQUIPMENT = {t.type: t for t in [
     _t("cstr", "CSTR reactor", "R", ["in1"], ["out1"],
        {"max_capacity": 1000.0, "height": 3.0, "initial_volume": 300.0, "composition": {"water": 1.0},
         "temperature": 20.0, "cooling_ua": 500.0, "reactions": ["A_B_to_C"]}),
+    _t("pfr", "PFR tubular reactor", "TR", ["in1"], ["out1"],
+       {"tube_volume": 60.0, "temperature": 20.0, "cooling_ua": 3000.0, "reactions": ["A_B_to_C"]}),
     _t("pump", "Pump", "P", ["in"], ["out"], {"shutoff_head": 0.5, "max_flow": 2.4}),
     _t("valve", "Valve", "XV", ["in"], ["out"], {"rated_dp": 0.5, "max_flow": 4.0}),
     _t("check_valve", "Check valve", "CV", ["in"], ["out"]),

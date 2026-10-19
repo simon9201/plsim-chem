@@ -19,7 +19,7 @@ GAS = "#bfe0ff"
 SELECTED = "#0050c8"
 
 TYPE_COLOURS = {
-    "storage_tank": "#a9d8c8", "cstr": "#f5c38b", "flash_drum": "#c8c3f0", "gas_volume": GAS,
+    "storage_tank": "#a9d8c8", "cstr": "#f5c38b", "pfr": "#f0a96b", "flash_drum": "#c8c3f0", "gas_volume": GAS,
     "distillation_column": "#d6b3f0", "dryer": "#f7b6c9", "evaporator": "#f9d29a",
     "heat_exchanger": "#f4a58a", "pump": "#9fdca8", "compressor": "#8fd1d6",
     "valve": "#ffe08a", "check_valve": "#ffe08a", "utility_valve": "#ffe08a",

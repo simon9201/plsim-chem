@@ -78,6 +78,10 @@ def demo_plant_command():
     return [PYTHON, "-u", os.path.join(ROOT, "Data", "build_demo_plant.py")]
 
 
+def training_plant_command():
+    return [PYTHON, "-u", os.path.join(ROOT, "Data", "build_training_plant.py")]
+
+
 class ProcessManager:
     """Child processes by label, with their output lines collected on a queue (read from the Tk thread)."""
 
@@ -190,6 +194,9 @@ class Launcher(App):
                           ("Build demo plant (guided tour)",
                            lambda: self.start("Demo plant", demo_plant_command(),
                                               after=lambda: self.reload_plants(select="demo_plant"))),
+                          ("Build reactor training plant (CSTR + PFR)",
+                           lambda: self.start("Training plant", training_plant_command(),
+                                              after=lambda: self.reload_plants(select="reactor_training_plant"))),
                           ("Build example plant", lambda: self.start("Example plant", test_plant_command(),
                                                                      after=self.reload_plants))):
             ttk.Button(box, text=text, command=cmd).pack(fill="x", padx=6, pady=3)

@@ -15,7 +15,7 @@ from Modules.GUI.projection import Camera
 #   drag background: rotate    mouse wheel: zoom    drag equipment: move on its floor level
 # =====================================================================
 
-TANKS = ("storage_tank", "cstr", "flash_drum", "gas_volume", "distillation_column", "dryer", "evaporator")
+TANKS = ("storage_tank", "cstr", "pfr", "flash_drum", "gas_volume", "distillation_column", "dryer", "evaporator")
 VALVES = ("valve", "check_valve", "utility_valve", "gas_valve", "gas_check_valve")
 PUMPS = ("pump", "compressor")
 PIPES = ("pipe", "elbow", "gas_pipe", "heat_exchanger")

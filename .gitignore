@@ -5,4 +5,5 @@ __pycache__/
 venv/
 Data/watchdog_model.npz
 Data/*.csv
+Data/corpus/
 DEVLOG_INTERNAL.md
