@@ -30,6 +30,9 @@ class ProcessEquipment(Entity):
         self.gas_inlets = []
         self.gas_outlets = []
         self.flow = 0.0     # L/s through the equipment during the last step (mol/s for gas equipment)
+        # Location in the plant in metres (x, y horizontal, z = elevation of the equipment's base/centreline).
+        # The loader sets it from the editor. Only z changes the hydraulics (static head); x, y give pipe lengths.
+        self.location = (0.0, 0.0, 0.0)
 
     def split_gas_ports(self):
         """Mixed liquid/gas equipment: ports named 'gas...' or 'vapor...' move to gas_inlets / gas_outlets."""
@@ -56,11 +59,24 @@ class ProcessEquipment(Entity):
     def slow_update(self, dt, ambient):
         pass
 
+    def draw_at(self, port, material):
+        """Liquid leaves through port. Equipment with several separate holdups (a column's sump and reflux drum) overrides this."""
+        self.draw(material)
+
+    def receive_at(self, port, material):
+        self.receive(material)
+
     def can_supply(self, port):
         return False
 
     def can_accept(self, port):
         return False
+
+    def max_outflow_at(self, port, dt):
+        return self.max_outflow(dt)
+
+    def max_inflow_at(self, port, dt):
+        return self.max_inflow(dt)
 
     def max_outflow(self, dt):
         """L/s the equipment could deliver for one step in total."""

@@ -1,6 +1,7 @@
 import math
 
 from Modules.Entity.Process_equipment.Vessel.Reactor.Reactor import Reactor
+from Modules.Flow import kinetics
 from Modules.Flow.chemistry import REACTIONS
 
 # =====================================================================
@@ -32,10 +33,12 @@ class ContinuousStirredTankReactor(Reactor):
 
     def update(self, dt):
         self.heat_released = 0.0
-        heat_total = 0.0
-        for name in self.reaction_names:
-            heat_total += self._react(REACTIONS[name], dt)
-        self.heat_released = heat_total / dt
+        reactions = [REACTIONS[name] for name in self.reaction_names]
+        if reactions and self.volume > 0:
+            # All reactions advance together (coupled RK4) so consecutive, competing and reversible ones are right.
+            self.contents.temperature, heat_total = kinetics.advance(
+                self.contents.moles, self.contents.temperature, reactions, dt)
+            self.heat_released = heat_total / dt
 
         cp = self.contents.heat_capacity
         self.cooling_duty = 0.0
@@ -45,40 +48,6 @@ class ContinuousStirredTankReactor(Reactor):
             self.contents.temperature = self.coolant_temp + (old_temperature - self.coolant_temp) * math.exp(
                 -ua * dt / cp)
             self.cooling_duty = cp * (old_temperature - self.temperature) / dt
-
-    def _react(self, reaction, dt):
-        """Advance one reaction over dt. Returns the heat released (J, positive = exothermic)."""
-        heat = 0.0
-        enthalpy = reaction.enthalpy()
-        reactants = {c: -nu for c, nu in reaction.stoichiometry.items() if nu < 0}
-        steps_done, nsub = 0, 1
-        while steps_done < nsub:
-            volume = self.volume
-            if volume <= 0:
-                break
-            conc = {c: self.contents.moles.get(c, 0.0) / volume for c in reaction.orders}
-            rate = reaction.rate_constant(self.temperature)
-            for c, order in reaction.orders.items():
-                rate *= conc[c] ** order
-            if steps_done == 0:
-                # Substep when the reaction is fast compared to the step, to stay stable.
-                smallest = min((conc[c] for c in reactants), default=0.0)
-                kappa = rate / smallest if smallest > 1e-12 else 0.0
-                nsub = min(200, max(1, math.ceil(kappa * dt / 0.05)))
-            h = dt / nsub
-            extent = rate * volume * h
-            for c, coeff in reactants.items():
-                extent = min(extent, self.contents.moles.get(c, 0.0) / coeff)
-            if extent > 0:
-                for c, nu in reaction.stoichiometry.items():
-                    self.contents.moles[c] = max(0.0, self.contents.moles.get(c, 0.0) + nu * extent)
-                q = -enthalpy * extent
-                heat += q
-                cp = self.contents.heat_capacity
-                if cp > 0:
-                    self.contents.temperature += q / cp
-            steps_done += 1
-        return heat
 
     def get_state(self):
         state = super().get_state()

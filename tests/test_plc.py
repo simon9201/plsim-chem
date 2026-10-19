@@ -15,6 +15,7 @@ from Data.build_test_plant import PLANT_NAME, build_test_plant
 from Data.loader import load_plant
 from Data.tags import export_gvl, load_tags, sync_tags
 from Modules.PLC.bridge import AdsLink, LinkError, LoopbackLink, PlcBridge
+from Modules.PLC.monitor import PlcCycle
 
 DT = 0.1
 
@@ -58,7 +59,8 @@ class PlcLoopTests(unittest.TestCase):
         cycle(plant, bridge, 10)
         self.assertTrue(mem[sym("XV111", "OpenFb")])
         self.assertTrue(mem[sym("P101", "RunningFb")])
-        self.assertAlmostEqual(mem[sym("FT101", "Value")], 2.0, delta=0.2)
+        self.assertAlmostEqual(plant.equipment["P101"].flow, 2.0, delta=0.3)
+        self.assertAlmostEqual(mem[sym("FT101", "Value")], 2.0, delta=0.6)      # the sensor has random noise
         self.assertGreater(plant.equipment["R201"].volume, 200.0)
 
     def test_raw_matches_value(self):
@@ -189,6 +191,67 @@ class AdsLinkTests(unittest.TestCase):
     def test_not_connected(self):
         with self.assertRaises(LinkError):
             AdsLink().read(["x"])
+
+
+class PlcMonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.plant, self.tags, self.link, _ = make_plant()
+        self.cyc = PlcCycle(self.plant, self.tags, self.link)
+
+    def run_for(self, seconds):
+        for _ in range(round(seconds / DT)):
+            self.cyc.step(DT)
+
+    def texts(self):
+        return [t for _, _, t in self.cyc.monitor.problems()]
+
+    def test_quiet_plant_has_no_problems_and_rows_show_values(self):
+        self.run_for(5)
+        self.assertEqual(self.cyc.monitor.problems(), [])
+        row = next(r for r in self.cyc.monitor.rows() if r["symbol"] == sym("TK101", "Value") or r["signal"] == "Value")
+        self.assertIsNotNone(row["value"])
+        self.assertGreater(self.cyc.scans, 40)
+
+    def test_pump_commanded_but_not_running_is_flagged_after_a_delay(self):
+        self.link.memory[sym("XV111", "OpenCmd")] = True
+        self.link.memory[sym("P101", "RunCmd")] = True
+        self.plant.equipment["P101"].tripped = True
+        self.run_for(5)
+        self.assertFalse(any("not running" in t for t in self.texts()))
+        self.run_for(10)
+        self.assertTrue(any("not running" in t for t in self.texts()))
+        self.assertIn("P101", self.cyc.monitor.problem_entities())
+
+    def test_dead_link_puts_plant_on_failsafe_and_is_reported(self):
+        self.run_for(2)
+
+        class Dead(LoopbackLink):
+            def connect(self):
+                raise LinkError("no route")
+
+        self.cyc.link = self.cyc.bridge.link = Dead()
+        self.cyc.connected = False
+        self.run_for(1)
+        self.assertTrue(any("link lost" in t for t in self.texts()))
+        self.assertGreater(self.plant.time, 2.0)        # still simulating on fail-safe
+
+    def test_frozen_sensor_and_broken_mapping(self):
+        self.link.memory[sym("XV111", "OpenCmd")] = True
+        self.link.memory[sym("P101", "RunCmd")] = True
+        self.run_for(20)
+        probe = self.plant.instruments["FT101"]
+        self.assertTrue(probe)
+        mon = self.cyc.monitor
+        symbol = sym("FT101", "Value")
+        mon.moved.add(symbol)
+        mon.changed_at[symbol] = mon.time - 500.0
+        self.assertTrue(any("frozen" in t for t in self.texts()))
+        mon.signals[sym("P101", "RunCmd")] = None
+        self.assertTrue(any("does not exist" in t for t in self.texts()))
+
+    def test_manual_command_on_loopback(self):
+        self.cyc.set_command(sym("P101", "RunCmd"), True)
+        self.assertTrue(self.link.memory[sym("P101", "RunCmd")])
 
 
 if __name__ == "__main__":

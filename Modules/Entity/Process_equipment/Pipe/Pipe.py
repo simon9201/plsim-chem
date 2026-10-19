@@ -17,19 +17,33 @@ from Modules.Flow.flow import Material
 #   ice      - forms when the wall is colder than the liquid's freezing_point_c, melts when warmer.
 # The wall temperature follows the liquid while it flows and drifts to the outdoor temperature
 # when stagnant (ambient_ua W/K, thermal_mass J/K). Pipes have no holdup, but remember the last liquid.
+#
+# Freeze-thaw fatigue: every time the wall drops below the liquid's freezing point and later warms
+# back up (by FATIGUE_HYSTERESIS_K) one cycle is counted, and the pipe takes `fatigue_per_cycle` damage
+# (more if a lot of ice formed). Past 50 % fatigue the pipe starts to weep: effective leak grows with
+# the square of the excess up to `fatigue_leak_max` L/s at 100 %. Northern winters therefore wear
+# pipes out slowly; tune the damage with the constructor / database params
+#   fatigue_per_cycle, fatigue_leak_max, ice_rate_scale, fouling_rate_scale
+# repair() resets fatigue and the cycle count.
 # =====================================================================
 
 FLUID_UA = 200.0        # W/K between flowing liquid and the pipe wall
 ICE_RATE = 5e-5         # ice fraction per K below freezing per second
 FOULING_RATE = 1e-5     # fouling fraction per (mol/L over saturation) per second
+FATIGUE_HYSTERESIS_K = 2.0      # the wall must warm this far above freezing to count a thaw
+SLURRY_CLOG_RATE = 2e-3         # fouling fraction per (mol/L undissolved) per second while slurry flows through
+HOTSPOT_ONSET = 0.2             # blockage above which the restriction creates damaging pressure hotspots
+HOTSPOT_RATE = 1e-4             # fatigue per second at a fully blocked (but still flowing) line
+FATIGUE_LEAK_ONSET = 0.5        # fatigue level where the pipe starts to leak
 
 
 class Pipe(Transfer):
-    FAULTS = ("leak_rate", "blockage", "fouling")
+    FAULTS = ("leak_rate", "blockage", "fouling", "fatigue")
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  diameter=0.05, length=5.0, friction_factor=0.02, fitting_k=0.0,
-                 ambient_ua=2.0, thermal_mass=2e4):
+                 ambient_ua=2.0, thermal_mass=2e4,
+                 fatigue_per_cycle=0.002, fatigue_leak_max=0.5, ice_rate_scale=1.0, fouling_rate_scale=1.0):
         super().__init__(name, description, status, inlets, outlets)
         self.diameter = diameter
         self.length = length
@@ -40,13 +54,28 @@ class Pipe(Transfer):
         self.blockage = 0.0
         self.fouling = 0.0
         self.ice = 0.0
+        self.fatigue_per_cycle = fatigue_per_cycle
+        self.fatigue_leak_max = fatigue_leak_max
+        self.ice_rate_scale = ice_rate_scale
+        self.fouling_rate_scale = fouling_rate_scale
+        self.fatigue = 0.0              # 0 = sound, 1 = split open
+        self.freeze_thaw_cycles = 0
+        self._frozen_cycle = False      # inside a freeze-thaw cycle (wall below freezing since the last thaw)
+        self._peak_ice = 0.0
         self.wall_temp = None
         self.contents = None        # last liquid seen in the pipe
         self.flowing = False
+        self.slurry_load = 0.0      # mol/L undissolved solid in the stream passing now
 
     @property
     def total_blockage(self):
         return 1.0 - (1.0 - self.blockage) * (1.0 - self.fouling) * (1.0 - self.ice)
+
+    @property
+    def effective_leak(self):
+        """Manual leak plus the weeping of a fatigued pipe (L/s)."""
+        excess = max(0.0, (self.fatigue - FATIGUE_LEAK_ONSET) / (1.0 - FATIGUE_LEAK_ONSET))
+        return self.leak_rate + self.fatigue_leak_max * excess * excess
 
     def is_blocked(self):
         return self.total_blockage >= 0.99
@@ -59,15 +88,38 @@ class Pipe(Transfer):
 
     def after_step(self, dt, starved, fluid=None):
         self.flowing = abs(self.flow) > 1e-6
+        self.slurry_load = 0.0
+        if self.flowing and fluid is not None and fluid.volume > 0:
+            self._carry_solids(dt, fluid)
         if fluid is not None and fluid.volume > 0 and (self.flowing or self.contents is None):
             self.contents = fluid.copy()
             if self.wall_temp is None:
                 self.wall_temp = fluid.temperature
 
+    def _carry_solids(self, dt, fluid):
+        """Undissolved solid in the stream (more of a component than the liquid can hold at its own
+        temperature, e.g. solids that a tank has not had time to dissolve) packs into the line. It
+        grows `fouling` quickly. Once the line is partly closed the flow squeezes through the
+        restriction and the pressure hotspot at the plug damages the pipe (`fatigue`)."""
+        load = 0.0
+        for name in fluid.moles:
+            attrs = COMPONENTS[name].attributes
+            if "solubility_25c" in attrs:
+                solubility = max(0.0, attrs["solubility_25c"] + attrs.get("solubility_slope", 0.0) * (fluid.temperature - 25.0))
+                load += max(0.0, fluid.concentration(name) - solubility)
+        self.slurry_load = load
+        if load > 1e-3:
+            self.fouling = min(1.0, self.fouling + SLURRY_CLOG_RATE * self.fouling_rate_scale * load * dt)
+        if self.total_blockage > HOTSPOT_ONSET:
+            self.fatigue = min(1.0, self.fatigue + HOTSPOT_RATE * (self.total_blockage - HOTSPOT_ONSET) * dt)
+
     def repair(self):
         """Clean and de-ice the line and remove a manual blockage."""
         super().repair()
         self.blockage = self.fouling = self.ice = 0.0
+        self.fatigue = self._peak_ice = 0.0
+        self.freeze_thaw_cycles = 0
+        self._frozen_cycle = False
 
     def slow_update(self, dt, ambient):
         if self.contents is None or self.wall_temp is None:
@@ -80,7 +132,8 @@ class Pipe(Transfer):
 
         freezing = self.contents.attribute_average("freezing_point_c")
         if freezing is not None:
-            self.ice = min(1.0, max(0.0, self.ice + ICE_RATE * (freezing - self.wall_temp) * dt))
+            self.ice = min(1.0, max(0.0, self.ice + ICE_RATE * self.ice_rate_scale * (freezing - self.wall_temp) * dt))
+            self._count_freeze_thaw(freezing)
 
         for name in self.contents.moles:
             attrs = COMPONENTS[name].attributes
@@ -89,10 +142,22 @@ class Pipe(Transfer):
             solubility = max(0.0, attrs["solubility_25c"] + attrs.get("solubility_slope", 0.0) * (self.wall_temp - 25.0))
             excess = self.contents.concentration(name) - solubility
             if excess > 0:
-                self.fouling = min(1.0, self.fouling + FOULING_RATE * excess * dt)
+                self.fouling = min(1.0, self.fouling + FOULING_RATE * self.fouling_rate_scale * excess * dt)
+
+    def _count_freeze_thaw(self, freezing):
+        self._peak_ice = max(self._peak_ice, self.ice)
+        if self.wall_temp < freezing:
+            self._frozen_cycle = True
+        elif self._frozen_cycle and self.wall_temp > freezing + FATIGUE_HYSTERESIS_K:
+            self._frozen_cycle = False
+            self.freeze_thaw_cycles += 1
+            self.fatigue = min(1.0, self.fatigue + self.fatigue_per_cycle * (0.5 + self._peak_ice))
+            self._peak_ice = 0.0
 
     def get_state(self):
-        return {"blockage": float(self.blockage), "fouling": float(self.fouling), "ice": float(self.ice),
+        return {"fatigue": float(self.fatigue), "freeze_thaw_cycles": int(self.freeze_thaw_cycles),
+                "frozen_cycle": bool(self._frozen_cycle), "peak_ice": float(self._peak_ice),
+                "blockage": float(self.blockage), "fouling": float(self.fouling), "ice": float(self.ice),
                 "wall_temp": None if self.wall_temp is None else float(self.wall_temp),
                 "contents": self.contents.to_state() if self.contents is not None else None}
 
@@ -100,6 +165,10 @@ class Pipe(Transfer):
         self.blockage = state["blockage"]
         self.fouling = state.get("fouling", 0.0)
         self.ice = state.get("ice", 0.0)
+        self.fatigue = state.get("fatigue", 0.0)
+        self.freeze_thaw_cycles = state.get("freeze_thaw_cycles", 0)
+        self._frozen_cycle = state.get("frozen_cycle", False)
+        self._peak_ice = state.get("peak_ice", 0.0)
         self.wall_temp = state.get("wall_temp")
         self.contents = Material.from_state(state["contents"]) if state.get("contents") else None
         self.flowing = False

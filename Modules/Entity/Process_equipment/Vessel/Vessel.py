@@ -5,7 +5,13 @@ from Modules.Flow.flow import Material, COMPONENTS
 # =====================================================================
 # Parent class: ProcessEquipment
 # Class: Vessel (holds liquid: a Material of moles per component + temperature)
-# Subclasses: StorageTank, Reactor -> CSTR
+# Subclasses: StorageTank, Reactor -> CSTR, FlashDrum, DistillationColumn, Evaporator, Dryer
+#
+# Besides liquid, a vessel tracks three kinds of solid state:
+#   slurry  - suspended, undissolved solid; leaves with the outflow and dissolves at DISSOLUTION_RATE * mix_rate
+#   solids  - settled solid on the bottom (precipitated or settled slurry); takes volume, plugs the outlet
+#   frozen  - error state below the freezing point; nothing flows
+# run_step() is the one method the plant calls per step; subclasses override update().
 #
 # Inlets enter at the top (headspace pressure). Outlets leave at the bottom
 # (headspace pressure + the pressure of the liquid column), so a tank can
@@ -21,6 +27,8 @@ class Vessel(ProcessEquipment):
     CRYSTALLIZATION_RATE = 0.05     # 1/s, how fast excess dissolved solid comes out of solution (and redissolves)
     THAW_MARGIN = 1.0               # K above the freezing point before a frozen vessel thaws
     SOLIDS_PLUG_FRACTION = 0.5      # solids filling this fraction of the vessel plug the bottom outlets
+    DISSOLUTION_RATE = 0.01         # 1/s, how fast suspended solid dissolves into liquid that has room (x mix_rate)
+    SETTLING_RATE = 0.02            # 1/s, how fast suspended solid that cannot dissolve settles out
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  max_capacity=1000.0, height=3.0, headspace_pressure=P_ATM,
@@ -31,6 +39,8 @@ class Vessel(ProcessEquipment):
         self.height = height                    # m
         self.headspace_pressure = headspace_pressure
         self.solids = {}                        # {component: mol} settled solid on the bottom, out of solution
+        self.slurry = {}                        # {component: mol} suspended, not yet dissolved solid (leaves with the flow)
+        self.mix_rate = 1.0                     # agitation factor for dissolving (0 = stirrer off)
         self.frozen = False                     # error state: the contents are frozen solid, nothing can flow
         if initial_volume > 0:
             if not composition:
@@ -78,7 +88,12 @@ class Vessel(ProcessEquipment):
 
     @property
     def hydrostatic_pressure(self):
-        return self.contents.density * G * self.level / 1e5
+        # volume is computed once: level and density would each recompute it
+        contents = self.contents
+        volume = contents.volume
+        if volume <= 0:
+            return 0.0
+        return contents.mass / volume * G * (self.height * volume / self.max_capacity) / 1e5
 
     @property
     def pressure(self):
@@ -113,11 +128,29 @@ class Vessel(ProcessEquipment):
         return self.volume < 0.01
 
     def stream(self, port):
-        return self.contents.copy()
+        """What leaves through a port: the liquid plus any suspended (undissolved) solid."""
+        out = self.contents.copy()
+        for k, n in self.slurry.items():
+            out.moles[k] = out.moles.get(k, 0.0) + n
+        return out
 
     def draw(self, material):
         for k, n in material.moles.items():
+            held = self.slurry.get(k, 0.0)
+            if held > 0:
+                share = held / (held + self.contents.moles.get(k, 0.0))
+                from_slurry = min(held, n * share)
+                self.slurry[k] = held - from_slurry
+                n -= from_slurry
+                if self.slurry[k] < 1e-12:
+                    del self.slurry[k]
             self.contents.moles[k] = max(0.0, self.contents.moles.get(k, 0.0) - n)
+
+    def add_solids(self, component, moles):
+        """Charge solid into the liquid (a bag of powder, a lot of crystals). It is suspended and has to
+        dissolve (DISSOLUTION_RATE * mix_rate) before it is safe to send downstream; whatever cannot
+        dissolve settles to the bottom."""
+        self.slurry[component] = self.slurry.get(component, 0.0) + moles
 
     def receive(self, material):
         self.contents.add(material)
@@ -150,6 +183,7 @@ class Vessel(ProcessEquipment):
         volume = self.volume
         if volume <= 0:
             return
+        self.update_slurry(dt, volume)
         fraction = 1.0 - math.exp(-self.CRYSTALLIZATION_RATE * dt)
         for name in set(self.contents.moles) | set(self.solids):
             attrs = COMPONENTS[name].attributes
@@ -181,6 +215,26 @@ class Vessel(ProcessEquipment):
         elif self.temperature > freezing + self.THAW_MARGIN:
             self.frozen = False
 
+    def update_slurry(self, dt, volume):
+        """Suspended solid dissolves into any headroom below saturation (rate DISSOLUTION_RATE * mix_rate,
+        so a stopped agitator or a cold liquid takes much longer) and the rest settles out."""
+        if not self.slurry:
+            return
+        dissolve = 1.0 - math.exp(-self.DISSOLUTION_RATE * self.mix_rate * dt)
+        settle = 1.0 - math.exp(-self.SETTLING_RATE * dt)
+        for name in list(self.slurry):
+            attrs = COMPONENTS[name].attributes
+            solubility = max(0.0, attrs.get("solubility_25c", float("inf")) + attrs.get("solubility_slope", 0.0) * (self.temperature - 25.0))
+            headroom = max(0.0, solubility * volume - self.contents.moles.get(name, 0.0))
+            dissolved = min(self.slurry[name], headroom * dissolve) if headroom != float("inf") else self.slurry[name] * dissolve
+            self.slurry[name] -= dissolved
+            self.contents.moles[name] = self.contents.moles.get(name, 0.0) + dissolved
+            settled = self.slurry[name] * settle
+            self.slurry[name] -= settled
+            self.solids[name] = self.solids.get(name, 0.0) + settled
+            if self.slurry[name] < 1e-12:
+                del self.slurry[name]
+
     def clean(self):
         """Remove settled solids (drain the sump)."""
         self.solids.clear()
@@ -191,12 +245,14 @@ class Vessel(ProcessEquipment):
 
     def get_state(self):
         state = self.contents.to_state()
-        if self.solids or self.frozen:
+        if self.solids or self.frozen or self.slurry:
             state["solids"] = {k: float(n) for k, n in self.solids.items()}
+            state["slurry"] = {k: float(n) for k, n in self.slurry.items()}
             state["frozen"] = bool(self.frozen)
         return state
 
     def set_state(self, state):
         self.contents = Material.from_state(state)
         self.solids = dict(state.get("solids", {}))
+        self.slurry = dict(state.get("slurry", {}))
         self.frozen = bool(state.get("frozen", False))

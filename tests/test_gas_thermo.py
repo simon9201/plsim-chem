@@ -477,6 +477,34 @@ class SolidsAndFreezingTests(unittest.TestCase):
         run(p, 600)
         self.assertTrue(t.frozen)
 
+    def test_fresh_solids_need_time_to_dissolve_and_a_stopped_stirrer_settles_them(self):
+        p, t = self._tank(salt_fraction=0.0)
+        t.add_solids("salt", 50.0)
+        self.assertGreater(t.stream("out").moles["salt"], 49.0)         # leaves with the flow while suspended
+        run(p, 30)
+        self.assertGreater(t.slurry["salt"], 5.0)                       # not dissolved yet
+        run(p, 600)
+        self.assertNotIn("salt", t.slurry)
+        self.assertAlmostEqual(t.contents.moles["salt"] + t.solids.get("salt", 0.0), 50.0, places=6)
+        p2, t2 = self._tank(salt_fraction=0.0)
+        t2.mix_rate = 0.0
+        t2.add_solids("salt", 50.0)
+        run(p2, 600)
+        self.assertLess(t2.slurry.get("salt", 0.0), 0.1)                     # without stirring it settles instead
+
+    def test_slurry_clogs_a_pipe_and_the_restriction_damages_it(self):
+        pipe = Pipe("P")
+        pipe.flow = 1.0
+        slurry = Material.from_fractions({"water": 0.97, "salt": 0.03}, 100.0, 25.0)    # far above saturation
+        clean = Material.from_fractions({"water": 1.0}, 100.0, 25.0)
+        pipe.after_step(1.0, False, clean)
+        self.assertEqual(pipe.fouling, 0.0)
+        for _ in range(600):
+            pipe.after_step(1.0, False, slurry)
+        self.assertGreater(pipe.slurry_load, 0.5)
+        self.assertGreater(pipe.fouling, 0.5)
+        self.assertGreater(pipe.fatigue, 0.0)
+
     def test_solids_and_frozen_flag_survive_snapshot(self):
         p, t = self._tank()
         run(p, 60)

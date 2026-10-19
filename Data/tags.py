@@ -1,3 +1,9 @@
+# =====================================================================
+# PLC tag table: which simulation signal is which TwinCAT variable.
+#   sync_tags  - make the plc_tag rows match the plant's signals (keeps symbols you renamed)
+#   load_tags  - read the mapping for PlcBridge
+#   export_gvl - write the TwinCAT global variable list to paste into the PLC project
+# =====================================================================
 from dataclasses import dataclass
 
 from sqlalchemy import select

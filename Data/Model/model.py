@@ -36,6 +36,22 @@ class Plant(Base):
         back_populates="plant", cascade="all, delete-orphan")
     snapshots: Mapped[list["Snapshot"]] = relationship(
         back_populates="plant", cascade="all, delete-orphan")
+    scenarios: Mapped[list["ScenarioRow"]] = relationship(
+        back_populates="plant", cascade="all, delete-orphan")
+
+
+class ScenarioRow(Base):
+    """A saved scenario (timeline of events, see Modules/Scenario). `events` is a JSON list."""
+    __tablename__ = "scenario"
+    __table_args__ = (UniqueConstraint("plant_id", "name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plant_id: Mapped[int] = mapped_column(ForeignKey("plant.id"))
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    events: Mapped[list] = mapped_column(JSON, default=list)
+
+    plant: Mapped["Plant"] = relationship(back_populates="scenarios")
 
 
 class ChemComponent(Base):
@@ -63,6 +79,9 @@ class ChemReaction(Base):
     orders: Mapped[dict | None] = mapped_column(JSON, default=None)
     heat_of_reaction: Mapped[float | None]          # J/mol, empty = derived from formation enthalpies
     description: Mapped[str] = mapped_column(String(500), default="")
+    reversible: Mapped[bool] = mapped_column(default=False)
+    k_equilibrium_ref: Mapped[float | None]         # Kc at 25 C, required when reversible
+    reverse_orders: Mapped[dict | None] = mapped_column(JSON, default=None)
 
 
 class Snapshot(Base):

@@ -12,6 +12,7 @@ from Data.Model.model import (Base, Plant, add_equipment, add_instrument, connec
 from Data.chemistry import seed_chemistry
 from Data.database import get_engine, DB_PATH
 from Data.loader import load_plant
+from Modules.Editor.document import PlantDocument
 from Data.tags import sync_tags, export_gvl, load_tags
 
 PLANT_NAME = "test_plant"
@@ -102,6 +103,9 @@ def build_test_plant(session):
     add_instrument(plant, "FT201", "flow_sensor", eq["XV201"], {"noise_std": 0.02})
     add_instrument(plant, "AT201", "analyzer", eq["R201"], {"component": "C", "noise_std": 0.01})
     session.commit()
+    doc = PlantDocument(session, PLANT_NAME)        # positions for the editor (the model itself does not need them)
+    doc.auto_layout()
+    doc.save()
     return plant
 
 

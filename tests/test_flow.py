@@ -313,7 +313,7 @@ class FlowTests(unittest.TestCase):
             [Component("water", 18.015, 997.0, 75.3, -285830.0, {"freezing_point_c": 0.0}),
              Component("A", 60.0, 1000.0, 120.0, -100e3, {"solubility_25c": 1.0, "solubility_slope": 0.05}),
              Component("B", 46.0, 800.0, 110.0, -50e3), Component("C", 106.0, 900.0, 190.0, -290e3)],
-            DEFAULT_REACTIONS)
+            DEFAULT_REACTIONS[:1])
         p, pipe = self._line({"water": 0.99, "A": 0.01})
         p.slow_time_scale = 20.0
         run(p, 600)

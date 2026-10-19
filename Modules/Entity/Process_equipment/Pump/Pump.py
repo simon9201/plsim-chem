@@ -1,4 +1,5 @@
 from Modules.Entity.Entity import Signal, TO_PLC, FROM_PLC
+from Modules.Entity.Process_equipment.Motor.motor import Motor
 from Modules.Entity.Process_equipment.transfer import Transfer
 
 # =====================================================================
@@ -14,6 +15,11 @@ from Modules.Entity.Process_equipment.transfer import Transfer
 # `npsh_required` (bar), the pump cavitates. Severity (0..1) grows with the shortfall, cuts the
 # head by up to 60 % and, if it lasts (`cavitation_trip` severity-seconds), trips the pump.
 # Typical causes: closed or throttled suction valve, low tank level, hot liquid, blocked suction line.
+#
+# Electrical drive: `self.motor` (Motor, see Motor/motor.py) feels the plant's PowerSupply. A sagging
+# supply makes the pump draw more current and run hotter, it loses speed below 90 % voltage, and it
+# trips on undervoltage / overtemperature. Long hot running ages the insulation until the motor burns
+# out (permanent until repair). Signals: Current, WindingTemp, Voltage, Vibration.
 # =====================================================================
 
 CAVITATION_HEAD_LOSS = 0.6
@@ -29,8 +35,9 @@ class Pump(Transfer):
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  shutoff_head=3.0, max_flow=6.0, ramp_time=2.0, dry_run_trip=2.0,
-                 npsh_required=0.3, cavitation_trip=10.0):
+                 npsh_required=0.3, cavitation_trip=10.0, rated_kw=2.2):
         super().__init__(name, description, status, inlets, outlets)
+        self.motor = Motor(rated_kw)
         self.shutoff_head = shutoff_head
         self.max_flow = max_flow
         self.ramp_time = ramp_time
@@ -63,7 +70,7 @@ class Pump(Transfer):
         return head * (1.0 - CAVITATION_HEAD_LOSS * self.cavitation) * (1.0 - WEAR_HEAD_LOSS * self.wear)
 
     def advance(self, dt):
-        target = self.speed_sp if self.status and self.run_cmd and not self.tripped else 0.0
+        target = self.speed_sp * self.motor.speed_factor() if self.status and self.run_cmd and not self.tripped else 0.0
         step = 100.0 * dt / self.ramp_time if self.ramp_time > 0 else 100.0
         self.speed += max(-step, min(step, target - self.speed))
 
@@ -76,15 +83,23 @@ class Pump(Transfer):
             self.dry_time = max(0.0, self.dry_time - dt)
         self._update_cavitation(dt, fluid)
         self.deadheading = self.running and abs(self.flow) < 0.05 * self.max_flow
+        # Shaft load follows the affinity laws (n^3) and rises with flow; the motor turns it into amps and heat.
+        n = self.speed / 100.0
+        load = n ** 3 * (0.5 + 0.5 * min(1.0, abs(self.flow) / self.max_flow))
+        vibration = 4.0 * self.wear + 3.0 * self.cavitation + (1.5 if self.deadheading else 0.0)
+        if self.motor.update(dt, load, self.running, vibration):
+            self.tripped = True
 
     def repair(self):
-        """Overhaul: new wear parts. A trip stays until the PLC sends ResetCmd, like on a real pump."""
+        """Overhaul: new wear parts and a new motor winding. A trip stays until the PLC sends ResetCmd, like on a real pump."""
         super().repair()
         self.wear = 0.0
         self.cavitation_time = 0.0
+        self.motor.repair()
 
     def slow_update(self, dt, ambient):
         """Wear from the abuse seen in the last step: cavitation, running dry, running against a closed discharge."""
+        self.motor.slow_update(dt, ambient)
         rate = self.cavitation / CAVITATION_LIFE
         rate += (1.0 / DEADHEAD_LIFE) if self.deadheading else 0.0
         rate += (1.0 / DRY_LIFE) if self.dry_time > 0 else 0.0
@@ -113,7 +128,7 @@ class Pump(Transfer):
             self.speed_sp = min(100.0, max(0.0, value))
 
     def _reset(self, value):
-        if value:
+        if value and self.motor.reset():     # a burnt-out motor stays tripped
             self.tripped = False
             self.dry_time = 0.0
             self.cavitation_time = 0.0
@@ -126,13 +141,17 @@ class Pump(Transfer):
             Signal("RunningFb", TO_PLC, "BOOL", get=lambda: self.running),
             Signal("Fault", TO_PLC, "BOOL", get=lambda: self.tripped),
             Signal("Speed", TO_PLC, "REAL", "%", get=lambda: self.speed),
+            Signal("Current", TO_PLC, "REAL", "A", get=lambda: self.motor.current),
+            Signal("WindingTemp", TO_PLC, "REAL", "C", get=lambda: self.motor.winding_temp),
+            Signal("Voltage", TO_PLC, "REAL", "V", get=lambda: self.motor.voltage),
+            Signal("Vibration", TO_PLC, "REAL", "mm/s", get=lambda: self.motor.vibration),
         ]
 
     def get_state(self):
         return {"run_cmd": bool(self.run_cmd), "speed_sp": float(self.speed_sp), "speed": float(self.speed),
                 "tripped": bool(self.tripped), "dry_time": float(self.dry_time),
                 "cavitation": float(self.cavitation), "cavitation_time": float(self.cavitation_time),
-                "wear": float(self.wear)}
+                "wear": float(self.wear), "motor": self.motor.get_state()}
 
     def set_state(self, state):
         self.run_cmd, self.speed_sp, self.speed = state["run_cmd"], state["speed_sp"], state["speed"]
@@ -140,6 +159,7 @@ class Pump(Transfer):
         self.cavitation = state.get("cavitation", 0.0)
         self.cavitation_time = state.get("cavitation_time", 0.0)
         self.wear = state.get("wear", 0.0)
+        self.motor.set_state(state.get("motor", {}))
         self._last_speed_written = 0.0
 
     def apply_failsafe(self):

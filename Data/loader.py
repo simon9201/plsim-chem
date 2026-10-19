@@ -1,13 +1,24 @@
+# =====================================================================
+# Loader: turns a stored plant (database rows) into a live PlantModel.
+# EQUIPMENT_TYPES / INSTRUMENT_TYPES map the `type` string stored in the database to a Python class.
+# To add a new kind of equipment: write the class, register it here, and add a catalog entry in
+# Modules/Editor/catalog.py so the editor can place it. Chemistry (components, reactions) is loaded first
+# so every vessel sees the same property tables.
+# =====================================================================
 from sqlalchemy import select
 
 from Data.Model.model import IN, OUT, Plant
 from Data.chemistry import load_chemistry
+from Modules.Editor.document import METERS_PER_UNIT
 from Modules.Plant.plant_model import PlantModel
 from Modules.Entity.Process_equipment.Vessel.StorageTank.storage_tank import StorageTank
 from Modules.Entity.Process_equipment.Vessel.Reactor.CSTR.CSTR import ContinuousStirredTankReactor
 from Modules.Entity.Process_equipment.Vessel.FlashDrum.flash_drum import FlashDrum
 from Modules.Entity.Process_equipment.Gas.gas import (GasVolume, GasSource, GasSink, GasPipe, GasValve,
                                                       GasCheckValve, Compressor)
+from Modules.Entity.Process_equipment.Vessel.Column.column import DistillationColumn
+from Modules.Entity.Process_equipment.Drying.drying import Dryer, Evaporator
+from Modules.Entity.Process_equipment.HeatExchanger.heat_exchanger import HeatExchanger
 from Modules.Entity.Process_equipment.Pump.Pump import Pump
 from Modules.Entity.Process_equipment.Valve.Valve import Valve, CheckValve, UtilityValve
 from Modules.Entity.Process_equipment.Pipe.Pipe import Pipe, Elbow
@@ -42,6 +53,10 @@ EQUIPMENT_TYPES = {
     "gas_valve": GasValve,
     "gas_check_valve": GasCheckValve,
     "compressor": Compressor,
+    "heat_exchanger": HeatExchanger,
+    "evaporator": Evaporator,         # ports named gas* / vapor* join the gas network
+    "dryer": Dryer,
+    "distillation_column": DistillationColumn,
 }
 
 # Parameters that name another piece of equipment. They are linked after everything is built.
@@ -73,7 +88,7 @@ def load_plant(session, plant_name):
 
     for row in plant.equipment:
         cls = _lookup(EQUIPMENT_TYPES, row.type, row.tag_name)
-        params = dict(row.params)
+        params = {k: v for k, v in row.params.items() if not k.startswith("_")}   # "_ui" etc. are editor metadata
         leak_rate = params.pop("leak_rate", 0.0)
         eq_links = {k: params.pop(k) for k in LINK_PARAMS if k in params}
         if issubclass(cls, UtilityValve):
@@ -82,6 +97,8 @@ def load_plant(session, plant_name):
             ports = {"inlets": [p.name for p in row.ports if p.direction == IN],
                      "outlets": [p.name for p in row.ports if p.direction == OUT]}
         eq = model.add_equipment(cls(row.tag_name, **ports, **params))
+        ui = row.params.get("_ui", {})
+        eq.location = (ui.get("x", 0.0) * METERS_PER_UNIT, ui.get("y", 0.0) * METERS_PER_UNIT, float(ui.get("z", 0.0)))
         if leak_rate:
             model.set_fault(row.tag_name, "leak_rate", leak_rate)
         links += [(eq, attr, tag) for attr, tag in eq_links.items()]

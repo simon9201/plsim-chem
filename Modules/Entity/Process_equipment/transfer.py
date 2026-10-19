@@ -61,3 +61,7 @@ class Transfer(ProcessEquipment):
     def after_step(self, dt, starved, fluid=None):
         """Called after the flow is solved. `starved` = nothing available at the inlet side.
         `fluid` = the Material arriving at the inlet (None when nothing flows)."""
+
+    def condition_liquid(self, material, rate, dt):
+        """Change the liquid passing through (a heat exchanger heats or cools it). `rate` in L/s. Returns the material."""
+        return material

@@ -1,14 +1,16 @@
 import math
 
 from Modules.Entity.Process_equipment.Junction.junction import Junction
-from Modules.Entity.Process_equipment.process_equipment import ProcessEquipment
+from Modules.Entity.Process_equipment.process_equipment import ProcessEquipment, G
 from Modules.Entity.Process_equipment.transfer import Transfer
 from Modules.Entity.Process_equipment.Boundary.boundary import Source, Sink
 from Modules.Entity.Process_equipment.Vessel.Vessel import Vessel
 from Modules.Entity.Process_equipment.Pump.Pump import Pump
 from Modules.Plant.environment import Environment
 from Modules.Plant.gas_network import GasNetwork
+from Modules.Plant.power_supply import PowerSupply
 from Modules.Flow.flow import Material
+from Modules.Lab.lab import Laboratory
 
 # =====================================================================
 # PlantModel: the container that connects everything and advances time.
@@ -21,7 +23,9 @@ from Modules.Flow.flow import Material
 # Each step:
 #   1. actuators move (valve travel, pump ramp)
 #   2. the flow of every edge is solved from the pressure at its two ends:
-#          pressure drop = a * Q * |Q|   (a = sum of the element losses, pumps add a head b)
+#          pressure drop = a * Q * |Q| + static head   (a = sum of the element losses, pumps add a head b;
+#          static head = density * g * rise in elevation along the line, so pumping uphill is harder and a
+#          downhill line helps. Elevations are equipment.location[2], set from the editor)
 #      Junction pressures are unknown, so they are found by iteration until
 #      flow in = flow out at every junction.
 #   3. liquid (moles per component + temperature) is moved along the edges
@@ -45,6 +49,9 @@ class Edge:
         self.blocked = False
         self.one_way = False
         self.q_pos = self.q_neg = float("inf")
+        self.leaked = 0.0           # L/s lost along the line (set by record)
+        self.static = 0.0           # bar of static head from src to dst (negative = downhill)
+        self.statics = {}           # id(element) -> bar of static head across that element
 
     def end_resistance(self, node, port):
         return node.port_resistance(port) if isinstance(node, Junction) else 0.0
@@ -58,11 +65,41 @@ class Edge:
         self.b = sum(e.head_at_zero_flow() for e in self.elements)
         self.blocked = any(not e.status or e.is_blocked() for e in self.elements)
         self.one_way = any(e.one_way for e in self.elements)
+        self._refresh_static()
+
+    def _refresh_static(self):
+        """Elevation change along the line: the points are src, each element, dst. Element i carries the climb
+        from itself to the next point, so the pieces add up to z_dst - z_src."""
+        points = [self.src, *self.elements, self.dst]
+        z = [p.location[2] for p in points]
+        if all(v == z[0] for v in z):
+            self.static, self.statics = 0.0, {}
+            return
+        k = self._density() * G / 1e5
+        self.static = k * (z[-1] - z[0])
+        self.statics = {id(el): k * (z[i + 2] - z[i + 1]) for i, el in enumerate(self.elements)}
+        if self.elements:       # whatever the first element sits above/below the source belongs to the first element
+            first = self.elements[0]
+            self.statics[id(first)] += k * (z[1] - z[0])
+
+    def _density(self):
+        """g/L of the liquid in the line, for the static head."""
+        for node, port in ((self.src, self.src_port), (self.dst, self.dst_port)):
+            if isinstance(node, Junction):
+                if node.last_mix is not None and node.last_mix.volume > 0:
+                    return node.last_mix.density
+                continue
+            if not hasattr(node, "stream"):     # a Sink holds nothing to take a density from
+                continue
+            d =  node.stream(port).density
+            if d > 0:
+                return d
+        return 1000.0
 
     def flow(self):
         if self.blocked:
             return 0.0
-        dp = self.src.port_pressure(self.src_port) - self.dst.port_pressure(self.dst_port)
+        dp = self.src.port_pressure(self.src_port) - self.dst.port_pressure(self.dst_port) - self.static
         if self.b > 0:
             x = dp + self.b
             q = math.sqrt(x / self.a) if x > 0 else 0.0
@@ -80,7 +117,7 @@ class Edge:
         p_dst = self.dst.port_pressure(self.dst_port) + self.end_resistance(self.dst, self.dst_port) * quad
 
         def drop(el):
-            return el.loss_coefficient() * quad - el.head_at_zero_flow()
+            return el.loss_coefficient() * quad - el.head_at_zero_flow() + self.statics.get(id(el), 0.0)
 
         first_blocked = next((i for i, e in enumerate(self.elements) if not e.status or e.is_blocked()), None)
         stop = len(self.elements) if (q != 0 or first_blocked is None) else first_blocked
@@ -98,8 +135,20 @@ class Edge:
                 el.p_out, el.p_in = p, p + drop(el)
                 p = el.p_in
             blocked_el.p_in = p_block_in
-        for el in self.elements:
-            el.flow = q
+        # A leak removes liquid on the way: elements (and the node at the far end) see less flow past it.
+        leaked = 0.0
+        for el in (self.elements if q >= 0 else reversed(self.elements)):
+            own = getattr(el, "effective_leak", el.leak_rate)
+            el.flow = math.copysign(max(0.0, abs(q) - leaked - 0.5 * own), q) if q else 0.0
+            leaked += own
+        self.leaked = leaked
+
+    @property
+    def q_far(self):
+        """Flow that arrives at the receiving end (q minus everything that leaked out on the way)."""
+        if self.q == 0.0:
+            return 0.0
+        return self.q * max(0.0, 1.0 - self.leaked / abs(self.q))
 
 
 class PlantModel:
@@ -114,11 +163,14 @@ class PlantModel:
         # Slow processes (weather exchange, fouling, wear) run every slow_interval seconds of plant time.
         # slow_time_scale speeds them up (and the weather cycles) relative to the hydraulics.
         self.environment = Environment()
+        self.power = PowerSupply()      # electrical network shared by all motors (sags, noise, dips)
         self.slow_interval = 10.0
         self.slow_time_scale = 1.0
         self.slow_time = 0.0
         self._slow_acc = 0.0
+        self.maintenance_log = []       # (plant time, tag) for every repair; the health view reads it to re-baseline
         self._gas = GasNetwork(self)    # the gas side: GasVolume/Compressor/... (Modules/Plant/gas_network.py)
+        self.lab = Laboratory(self)     # simulated off-line analysis (Modules/Lab/lab.py)
 
     @property
     def ambient_temperature(self):
@@ -128,6 +180,8 @@ class PlantModel:
         if eq.name in self.equipment or eq.name in self.instruments:
             raise ValueError(f"Duplicate tag {eq.name}")
         self.equipment[eq.name] = eq
+        if hasattr(eq, "motor"):
+            eq.motor.supply = self.power
         self._dirty = True
         return eq
 
@@ -202,11 +256,11 @@ class PlantModel:
 
     @staticmethod
     def _out_cap(node, port, n, dt):
-        return node.max_outflow(dt) / n if node.status and node.can_supply(port) else 0.0
+        return node.max_outflow_at(port, dt) / n if node.status and node.can_supply(port) else 0.0
 
     @staticmethod
     def _in_cap(node, port, n, dt):
-        return node.max_inflow(dt) / n if node.status and node.can_accept(port) else 0.0
+        return node.max_inflow_at(port, dt) / n if node.status and node.can_accept(port) else 0.0
 
     def _net_inflow(self, junction):
         total = 0.0
@@ -274,19 +328,21 @@ class PlantModel:
             if abs(e.q) * dt < 1e-12:
                 continue
             if e.q > 0:
-                sup, sup_port, acc = e.src, e.src_port, e.dst
+                sup, sup_port, acc, acc_port = e.src, e.src_port, e.dst, e.dst_port
             else:
-                sup, sup_port, acc = e.dst, e.dst_port, e.src
+                sup, sup_port, acc, acc_port = e.dst, e.dst_port, e.src, e.src_port
             moved = self._supplied(sup, sup_port, cache, set()).scaled_to_volume(abs(e.q) * dt)
-            leaked = sum(el.leak_rate for el in e.elements)
+            for el in (e.elements if e.q > 0 else reversed(e.elements)):
+                moved = el.condition_liquid(moved, abs(e.q), dt)
+            leaked = sum(getattr(el, "effective_leak", el.leak_rate) for el in e.elements)
             received = moved.scaled(max(0.0, 1.0 - leaked / abs(e.q))) if leaked > 0 else moved
-            moves.append((sup, acc, moved, received))
-        for sup, _, moved, _ in moves:
+            moves.append((sup, sup_port, acc, acc_port, moved, received))
+        for sup, sup_port, _, _, moved, _ in moves:
             if not isinstance(sup, Junction):
-                sup.draw(moved)
-        for _, acc, _, received in moves:
+                sup.draw_at(sup_port, moved)
+        for _, _, acc, acc_port, _, received in moves:
             if not isinstance(acc, Junction):
-                acc.receive(received)
+                acc.receive_at(acc_port, received)
 
     # ------------------------------------------------------------ time stepping
     def step(self, dt):
@@ -298,6 +354,7 @@ class PlantModel:
             raise ValueError("slow_time_scale must be a finite non-negative number")
         if self._dirty:
             self._build_edges()
+        self.power.update(self.time, dt)
         for eq in self.equipment.values():
             if hasattr(eq, "advance"):
                 eq.advance(dt)
@@ -312,9 +369,10 @@ class PlantModel:
         for node, attached in self._node_edges.items():
             eq = self.equipment[node]
             if isinstance(eq, (Source, Sink)):
-                eq.flow = sum(abs(e.q) for e, _ in attached)
+                eq.flow = sum(abs(e.q_far if (r == "dst") == (e.q >= 0) else e.q) for e, r in attached)
             elif not isinstance(eq, Junction):
-                eq.flow = sum(e.q if r == "dst" else -e.q for e, r in attached)
+                eq.flow = sum((e.q_far if e.q >= 0 else e.q) if r == "dst" else -(e.q if e.q >= 0 else e.q_far)
+                              for e, r in attached)
         self._move_material(dt)
         self._gas.step(dt)
         for eq in self.equipment.values():
@@ -329,6 +387,7 @@ class PlantModel:
             for eq in self.equipment.values():
                 eq.slow_update(slow_dt, ambient)
         self.time += dt
+        self.lab.update()
         self.sample_instruments()
 
     def sample_instruments(self):
@@ -366,7 +425,7 @@ class PlantModel:
                 raise ValueError(f"{tag}.{name} must be a finite number") from err
             if not math.isfinite(value):
                 raise ValueError(f"{tag}.{name} must be a finite number")
-            if name in ("blockage", "fouling", "wear") and not 0.0 <= value <= 1.0:
+            if name in ("blockage", "fouling", "wear", "fatigue") and not 0.0 <= value <= 1.0:
                 raise ValueError(f"{tag}.{name} must be between 0 and 1")
             if name == "leak_rate" and value < 0.0:
                 raise ValueError(f"{tag}.{name} cannot be negative")
@@ -378,10 +437,11 @@ class PlantModel:
         settled solids are reset to like-new. Commands, trips (cleared by the PLC's reset) and the
         material inside are left alone. This is not "replace": the equipment keeps its identity and state."""
         self.equipment[tag].repair()
+        self.maintenance_log.append((self.time, tag))
 
     def repair_all(self):
-        for eq in self.equipment.values():
-            eq.repair()
+        for tag in self.equipment:
+            self.repair(tag)
 
     # ------------------------------------------------------------ snapshots
     def get_state(self):
@@ -394,7 +454,7 @@ class PlantModel:
         return {"time": float(self.time), "slow_time": float(self.slow_time),
                 "slow_acc": float(self._slow_acc), "slow_interval": float(self.slow_interval),
                 "slow_time_scale": float(self.slow_time_scale),
-                "environment": self.environment.get_state(), "equipment": equipment}
+                "environment": self.environment.get_state(), "power": self.power.get_state(), "equipment": equipment}
 
     def set_state(self, state):
         unknown = [t for t in state["equipment"] if t not in self.equipment]
@@ -412,4 +472,5 @@ class PlantModel:
         self.slow_interval = state.get("slow_interval", self.slow_interval)
         self.slow_time_scale = state.get("slow_time_scale", self.slow_time_scale)
         self.environment.set_state(state.get("environment", {}))
+        self.power.set_state(state.get("power", {}))
         self.sample_instruments()

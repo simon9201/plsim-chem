@@ -2,6 +2,7 @@ import math
 
 from Modules.Entity.Entity import Signal, TO_PLC, FROM_PLC
 from Modules.Entity.Process_equipment.process_equipment import ProcessEquipment, P_ATM
+from Modules.Entity.Process_equipment.Motor.motor import Motor
 from Modules.Entity.Process_equipment.transfer import Transfer
 from Modules.Entity.Process_equipment.Valve.Valve import ActuatedMixin
 from Modules.Flow.chemistry import COMPONENTS, R_GAS
@@ -361,8 +362,9 @@ class Compressor(GasTransfer):
 
     def __init__(self, name, description="", status=1, inlets=None, outlets=None,
                  max_flow=10.0, max_ratio=4.0, efficiency=0.75, gamma=1.4, ramp_time=3.0,
-                 surge_fraction=0.25, surge_trip=10.0, max_discharge_temp=180.0):
+                 surge_fraction=0.25, surge_trip=10.0, max_discharge_temp=180.0, rated_kw=30.0):
         super().__init__(name, description, status, inlets, outlets)
+        self.motor = Motor(rated_kw)    # electrical drive, see Motor/motor.py (feels the plant's PowerSupply)
         self.max_flow = max_flow
         self.max_ratio = max_ratio
         self.efficiency = efficiency
@@ -405,7 +407,7 @@ class Compressor(GasTransfer):
         return 1.0 + (self.shutoff_ratio() - 1.0) * (1.0 - (q / cap) ** 2)
 
     def advance(self, dt):
-        target = self.speed_sp if self.status and self.run_cmd and not self.tripped else 0.0
+        target = self.speed_sp * self.motor.speed_factor() if self.status and self.run_cmd and not self.tripped else 0.0
         step = 100.0 * dt / self.ramp_time if self.ramp_time > 0 else 100.0
         self.speed += max(-step, min(step, target - self.speed))
 
@@ -437,8 +439,16 @@ class Compressor(GasTransfer):
             self.power = 0.0
         elif self.discharge_temp > self.max_discharge_temp:
             self.tripped = True
+        # Shaft power = gas work / efficiency, plus friction that grows with speed; the motor turns it into amps and heat.
+        n = self.speed / 100.0
+        shaft = self.power / max(self.efficiency, 0.05)
+        load = 0.2 * n + shaft / (self.motor.rated_kw * 1000.0)
+        vibration = 4.0 * self.wear + (3.0 if self.surge else 0.0)
+        if self.motor.update(dt, load, self.running, vibration):
+            self.tripped = True
 
     def slow_update(self, dt, ambient):
+        self.motor.slow_update(dt, ambient)
         rate = (1.0 / SURGE_LIFE) if self.surge else 0.0
         if self.running and self.discharge_temp > self.max_discharge_temp:
             rate += 1.0 / OVERTEMP_LIFE
@@ -448,6 +458,7 @@ class Compressor(GasTransfer):
         super().repair()
         self.wear = 0.0
         self.surge_time = 0.0
+        self.motor.repair()
 
     def _write_speed(self, value):
         """Same rule as the pump: an untouched PLC variable reads 0 and must not count as a command."""
@@ -456,7 +467,7 @@ class Compressor(GasTransfer):
             self.speed_sp = min(100.0, max(0.0, value))
 
     def _reset(self, value):
-        if value:
+        if value and self.motor.reset():     # a burnt-out motor stays tripped
             self.tripped = False
             self.surge_time = 0.0
 
@@ -471,12 +482,16 @@ class Compressor(GasTransfer):
             Signal("Speed", TO_PLC, "REAL", "%", get=lambda: self.speed),
             Signal("Power", TO_PLC, "REAL", "kW", get=lambda: self.power / 1000.0),
             Signal("DischargeTemp", TO_PLC, "REAL", "C", get=lambda: self.discharge_temp),
+            Signal("Current", TO_PLC, "REAL", "A", get=lambda: self.motor.current),
+            Signal("WindingTemp", TO_PLC, "REAL", "C", get=lambda: self.motor.winding_temp),
+            Signal("Voltage", TO_PLC, "REAL", "V", get=lambda: self.motor.voltage),
+            Signal("Vibration", TO_PLC, "REAL", "mm/s", get=lambda: self.motor.vibration),
         ]
 
     def get_state(self):
         return {"run_cmd": bool(self.run_cmd), "speed_sp": float(self.speed_sp), "speed": float(self.speed),
                 "tripped": bool(self.tripped), "wear": float(self.wear), "surge_time": float(self.surge_time),
-                "discharge_temp": float(self.discharge_temp)}
+                "discharge_temp": float(self.discharge_temp), "motor": self.motor.get_state()}
 
     def set_state(self, state):
         self.run_cmd, self.speed_sp, self.speed = state["run_cmd"], state["speed_sp"], state["speed"]
@@ -484,6 +499,7 @@ class Compressor(GasTransfer):
         self.wear = state.get("wear", 0.0)
         self.surge_time = state.get("surge_time", 0.0)
         self.discharge_temp = state.get("discharge_temp", 25.0)
+        self.motor.set_state(state.get("motor", {}))
         self._last_speed_written = 0.0
 
     def apply_failsafe(self):

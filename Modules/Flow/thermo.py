@@ -20,8 +20,8 @@ from Modules.Flow.chemistry import COMPONENTS, R_GAS
 # A component with none of these is treated as NON-VOLATILE (salts, heavy products).
 #
 # What is deliberately simple, and where to improve it later:
-#   * The liquid is ideal: activity coefficients are 1. `set_activity_model` swaps in a real model
-#     (NRTL, Wilson, ...) without touching any equipment.
+#   * The liquid is ideal by default: activity coefficients are 1. `set_activity_model(nrtl_model({...}))` swaps in
+#     NRTL (Wilson etc. can be added the same way) without touching any equipment.
 #   * The vapor is an ideal gas (no fugacity coefficients).
 #   * Latent heat does not vary with temperature (Watson correlation would go in heat_of_vaporization).
 # =====================================================================
@@ -92,6 +92,40 @@ def activity_coefficients(x, t_c):
     return _activity_model(x, t_c)
 
 
+def nrtl_model(pairs):
+    """Build an activity model from NRTL binary parameters, for set_activity_model().
+    pairs = {("ethanol", "water"): (a12, b12, a21, b21, alpha)}   tau_ij = a_ij + b_ij / T[K]
+    The first four numbers are the Aspen-style dimensionless a and b [K] for the pair in the order written,
+    alpha is the non-randomness (usually 0.3). Pairs that are not listed behave ideally (tau = 0).
+    Taken from literature fits: check them against your own data before trusting azeotrope positions."""
+    tau_ab = {}
+    for (a, b), (a12, b12, a21, b21, alpha) in pairs.items():
+        tau_ab[(a, b)] = (a12, b12, alpha)
+        tau_ab[(b, a)] = (a21, b21, alpha)
+
+    def model(x, t_c):
+        t_k = t_c + 273.15
+        names = [n for n in x if x[n] > 0]
+        tau, g = {}, {}
+        for i in names:
+            for j in names:
+                a, b, alpha = tau_ab.get((i, j), (0.0, 0.0, 0.3)) if i != j else (0.0, 0.0, 0.3)
+                tau[i, j] = a + b / t_k
+                g[i, j] = math.exp(-alpha * tau[i, j])
+        total = sum(x[n] for n in names) or 1.0
+        xs = {n: x[n] / total for n in names}
+        den = {j: sum(xs[k] * g[k, j] for k in names) for j in names}
+        gamma = {n: 1.0 for n in x}
+        for i in names:
+            ln_g = sum(xs[j] * tau[j, i] * g[j, i] for j in names) / den[i]
+            for j in names:
+                ln_g += xs[j] * g[i, j] / den[j] * (
+                    tau[i, j] - sum(xs[m] * tau[m, j] * g[m, j] for m in names) / den[j])
+            gamma[i] = math.exp(ln_g)
+        return gamma
+    return model
+
+
 # ---------------------------------------------------------------- equilibrium
 def _normalize(comp):
     total = sum(v for v in comp.values() if v > 0)
@@ -142,10 +176,11 @@ def _bisect(f, lo, hi, iterations=80):
     return 0.5 * (lo + hi)
 
 
-def bubble_temperature(x, p_bar, t_min=-100.0, t_max=800.0):
+def bubble_temperature(x, p_bar, t_min=-100.0, t_max=800.0, iterations=80):
     """Temperature (C) at which a liquid of composition x boils at pressure p."""
     x = _normalize(x)
-    return _bisect(lambda t: sum(k * x.get(n, 0.0) for n, k in k_values(x, t, p_bar, x).items()) - 1.0, t_min, t_max)
+    return _bisect(lambda t: sum(k * x.get(n, 0.0) for n, k in k_values(x, t, p_bar, x).items()) - 1.0,
+                   t_min, t_max, iterations)
 
 
 def dew_temperature(y, p_bar, t_min=-100.0, t_max=800.0):

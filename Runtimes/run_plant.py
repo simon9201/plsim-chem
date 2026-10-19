@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import signal
 import sys
 import time
 
@@ -16,6 +17,7 @@ from Data.loader import load_plant
 from Data.snapshots import list_snapshots, load_snapshot, save_snapshot
 from Data.tags import load_tags
 from Modules.PLC.bridge import AdsLink, LinkError, LoopbackLink, PlcBridge
+from Modules.Watchdog.recorder import SignalRecorder, plant_sampler
 
 # =====================================================================
 # Runtime: loads a plant from the database and runs it in step with the PLC.
@@ -41,7 +43,11 @@ def main():
     ap.add_argument("--load-snapshot", help="restore this saved snapshot before starting")
     ap.add_argument("--save-snapshot", help="save a snapshot with this name when the run ends")
     ap.add_argument("--list-snapshots", action="store_true")
+    ap.add_argument("--record", help="save every PLC-visible signal to this CSV (1 row per --record-period s) for watchdog training")
+    ap.add_argument("--record-period", type=float, default=5.0)
     args = ap.parse_args()
+    if hasattr(signal, "SIGBREAK"):     # Windows: lets launcher.py stop the run cleanly so the snapshot/CSV is saved
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     if not math.isfinite(args.dt) or args.dt <= 0:
         ap.error("--dt must be a finite positive number")
     if not math.isfinite(args.speed) or args.speed <= 0:
@@ -73,6 +79,8 @@ def main():
 
         link = LoopbackLink() if args.offline else AdsLink(args.ams_net_id, args.port)
         bridge = PlcBridge(plant, tags, link)
+        recorder = SignalRecorder(args.record_period) if args.record else None
+        sample = plant_sampler(plant) if recorder else None
         connected = False
         start_time = plant.time
         next_tick = time.monotonic()
@@ -93,6 +101,8 @@ def main():
                     bridge.read_commands()
                     plant.step(args.dt)
                     bridge.write_feedback()
+                    if recorder:
+                        recorder.record(plant.time, sample())
                 except LinkError as err:
                     print(f"PLC link lost ({err}): fail-safe")
                     connected = False
@@ -109,6 +119,9 @@ def main():
             print("Stopped")
         finally:
             link.close()
+            if recorder and recorder.rows:
+                recorder.save_csv(args.record)
+                print(f"Saved {len(recorder.rows)} samples to {args.record}")
             if args.save_snapshot:
                 save_snapshot(session, args.plant, plant, args.save_snapshot, overwrite=True)
                 print(f"Saved snapshot '{args.save_snapshot}' at sim time {plant.time:.1f} s")

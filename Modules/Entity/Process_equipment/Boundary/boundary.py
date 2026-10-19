@@ -21,6 +21,7 @@ class Source(ProcessEquipment):
         self.temperature = temperature
         self.supply_pressure = supply_pressure
         self.supplied = Material({}, temperature)   # everything that has entered the plant here
+        self.lot = ""                               # id of the delivery batch currently arriving
 
     @property
     def pressure(self):
@@ -42,11 +43,18 @@ class Source(ProcessEquipment):
     def draw(self, material):
         self.supplied.add(material)
 
+    def set_lot(self, composition, lot_id=""):
+        """Change what arrives (a new delivery batch). The composition is normalised by Material.from_fractions."""
+        self.composition = dict(composition)
+        self.lot = lot_id
+
     def get_state(self):
-        return {"supplied": self.supplied.to_state()}
+        return {"supplied": self.supplied.to_state(), "composition": dict(self.composition), "lot": self.lot}
 
     def set_state(self, state):
         self.supplied = Material.from_state(state["supplied"])
+        self.composition = dict(state.get("composition", self.composition))
+        self.lot = state.get("lot", self.lot)
 
 
 class Sink(ProcessEquipment):
